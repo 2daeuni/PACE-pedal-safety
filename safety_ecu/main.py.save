@@ -1,0 +1,47 @@
+from canbus.receiver import CANReceiver
+from canbus.decoder import PEDAL_STATUS_ID, decode_pedal_status
+
+
+def main():
+    receiver = CANReceiver("can0")
+
+    try:
+        receiver.open()
+        print("[Safety ECU] Started")
+        print("[Safety ECU] Waiting for PEDAL_STATUS...")
+
+        while True:
+            msg = receiver.receive()
+
+            if msg is None:
+                continue
+
+            # PEDAL_STATUS (0x100)
+            if msg.arbitration_id != PEDAL_STATUS_ID:
+                continue
+
+            try:
+                pedal = decode_pedal_status(msg.data)
+
+            except ValueError as error                print(f"[PEDAL] Invalid message: {error}")
+                continue
+
+            print(
+                f"[PEDAL] "
+                f"ACC={pedal['accelerator']}% "
+                f"BRAKE={pedal['brake']}% "
+                f"ACC_RATE={pedal['accelerator_rate']:.1f}%/s "
+                f"BRAKE_RATE={pedal['brake_rate']:.1f}%/s "
+                f"STATUS=0x{pedal['sensor_status']:02X} "
+                f"ALIVE={pedal['alive_counter']}"
+            )
+
+    except KeyboardInterrupt:
+        print("\n[Safety ECU] Stopped")
+
+    finally:
+        receiver.close()
+
+
+if __name__ == "__main__":
+    main()
