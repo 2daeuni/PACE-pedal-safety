@@ -4,12 +4,6 @@ from sensors.tof import ToFSensor
 
 
 def tof_worker(data_queue):
-    """
-    ToF sensor worker process.
-
-    Sends sensor status and distance data
-    to the Safety ECU main process.
-    """
 
     tof = None
 
@@ -32,9 +26,6 @@ def tof_worker(data_queue):
 
         communication_error_start = None
 
-        # =============================================
-        # Measurement loop
-        # =============================================
         while True:
             distance, communication_ok = (
                 tof.read_distance()

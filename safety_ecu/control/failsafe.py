@@ -4,17 +4,6 @@ class FailSafeManager:
         self.reason = None
 
     def evaluate(self, state):
-        """
-        Evaluate fail-safe conditions.
-
-        Currently enabled:
-        - ToF sensor communication failure
-        - Pedal sensor error
-
-        Pedal ECU communication timeout will be
-        enabled after the actual Pedal ECU is
-        connected.
-        """
 
         # ToF communication failure
         if not state.tof_connected:

@@ -80,13 +80,6 @@ class SystemState:
         )
 
     def invalidate_distance(self):
-        """
-        Mark the current distance value as invalid.
-
-        The last measured distance is kept for
-        diagnostics, but must not be used for
-        risk calculation.
-        """
 
         self.distance_valid = False
 
@@ -94,13 +87,6 @@ class SystemState:
         self,
         timeout=0.5,
     ):
-        """
-        Invalidate the distance if a new valid
-        measurement has not been received within
-        the specified timeout.
-
-        This does not change tof_connected.
-        """
 
         if not self.distance_valid:
             return False

@@ -27,21 +27,6 @@ class ToFSensor:
         print("[ToF] Ranging started")
 
     def read_distance(self):
-        """
-        Returns:
-            (distance, communication_ok)
-
-        Normal measurement:
-            (distance_cm, True)
-
-        Communication is normal,
-        but no valid distance is available:
-            (None, True)
-
-        I2C communication failure:
-            (None, False)
-        """
-
         try:
             # Check whether new measurement data is ready
             if not self.sensor.data_ready:

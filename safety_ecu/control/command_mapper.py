@@ -5,32 +5,6 @@ class CommandMapper:
         risk_available,
         failsafe_active=False,
     ):
-        """
-        Convert Risk Level into Haptic / Motor command parameters.
-
-        Current stage:
-        - Define control structure only
-        - Do not apply real haptic tuning values yet
-        - Do not apply real motor output limit values yet
-
-        Returns:
-            {
-                "haptic": {
-                    "vibration_command": int,
-                    "intensity": int,
-                    "frequency": int,
-                },
-                "motor": {
-                    "control_mode": int,
-                    "output_limit": int,
-                    "command_flags": int,
-                },
-            }
-        """
-
-        # Risk judgment unavailable
-        # -> Haptic OFF
-        # -> Motor Normal
 
         # Fail-safe has the highest control priority.
         if failsafe_active:
