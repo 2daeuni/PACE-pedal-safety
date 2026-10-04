@@ -2,6 +2,7 @@ import struct
 
 
 PEDAL_STATUS_ID = 0x100
+HAPTIC_STATUS_ID = 0x200
 
 
 SENSOR_STATUS_BITS = {
@@ -105,6 +106,75 @@ def decode_pedal_status(data: bytes):
         "alive_counter": alive_counter,
     }
 
+def decode_haptic_status(data: bytes):
+    if len(data) != 8:
+        raise ValueError(
+            f"HAPTIC_STATUS must be 8 bytes, "
+            f"got {len(data)}"
+        )
+
+    risk_level = data[0]
+    vibration_status = data[1]
+    intensity = data[2]
+    frequency = data[3]
+    fault_code = data[4]
+    command_timeout = data[5]
+    ecu_status = data[6]
+    alive_counter = data[7]
+
+    if not 0 <= risk_level <= 3:
+        raise ValueError(
+            f"Risk level out of range: "
+            f"{risk_level}"
+        )
+
+    if vibration_status not in (0, 1):
+        raise ValueError(
+            f"Vibration status invalid: "
+            f"{vibration_status}"
+        )
+    if vibration_status == 0:
+        if intensity != 0 or frequency != 0:
+            raise ValueError(
+                "Haptic OFF state must have "
+                "intensity=0 and frequency=0"
+            )
+
+    else:
+        if not 1 <= intensity <= 100:
+            raise ValueError(
+                f"Haptic intensity out of range: "
+                f"{intensity}%"
+            )
+
+        if not 10 <= frequency <= 50:
+            raise ValueError(
+                f"Haptic frequency out of range: "
+                f"{frequency}Hz"
+            )
+
+    if command_timeout not in (0, 1):
+        raise ValueError(
+            f"Command timeout invalid: "
+            f"{command_timeout}"
+        )
+
+    if ecu_status not in (0, 1):
+        raise ValueError(
+            f"ECU status invalid: "
+            f"{ecu_status}"
+        )
+
+    return {
+        "risk_level": risk_level,
+        "vibration_status": vibration_status,
+        "intensity": intensity,
+        "frequency": frequency,
+        "fault_code": fault_code,
+        "command_timeout": command_timeout,
+        "ecu_status": ecu_status,
+        "alive_counter": alive_counter,
+    }
 
 if __name__ == "__main__":
     test_data = bytes.fromhex(

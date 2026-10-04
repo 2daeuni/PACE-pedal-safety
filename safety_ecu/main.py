@@ -6,7 +6,9 @@ from canbus.receiver import CANReceiver
 from canbus.sender import CANSender
 from canbus.decoder import (
     PEDAL_STATUS_ID,
+    HAPTIC_STATUS_ID,
     decode_pedal_status,
+    decode_haptic_status,
 )
 
 from control.state import SystemState
@@ -73,6 +75,11 @@ def main():
     pedal_timeout_reported = False
 
     # -------------------------------------------------
+    # Haptic ECU communication monitoring
+    # -------------------------------------------------
+    haptic_timeout_reported = False
+
+    # -------------------------------------------------
     # ToF process
     # -------------------------------------------------
     tof_queue = multiprocessing.Queue()
@@ -114,17 +121,132 @@ def main():
 
         while True:
             # -------------------------------------------------
-            # 1. CAN receive
+            # CAN receive
             # -------------------------------------------------
             msg = receiver.receive(
                 timeout=0.001
             )
 
-            if (
-                msg is not None
-                and msg.arbitration_id
-                == PEDAL_STATUS_ID
-            ):
+            if msg is not None:
+
+                if msg.arbitration_id == PEDAL_STATUS_ID:
+                    try:
+                        pedal = decode_pedal_status(
+                            msg.data
+                        )
+
+                        state.update_pedal(
+                            pedal
+                        )
+
+                        logger.log(
+                            state
+                        )
+
+                        last_pedal_time = (
+                            time.monotonic()
+                        )
+
+                        pedal_timeout_reported = (
+                            False
+                        )
+
+                        current_alive_counter = (
+                            pedal["alive_counter"]
+                        )
+
+                        if (
+                            previous_alive_counter
+                            is not None
+                        ):
+                            expected_alive_counter = (
+                                previous_alive_counter
+                                + 1
+                            ) % 256
+
+                            if (
+                                current_alive_counter
+                                != expected_alive_counter
+                            ):
+                                print(
+                                    "[PEDAL] "
+                                    "ALIVE COUNTER ERROR: "
+                                    f"expected="
+                                    f"{expected_alive_counter}, "
+                                    f"received="
+                                    f"{current_alive_counter}"
+                                )
+
+                        previous_alive_counter = (
+                            current_alive_counter
+                        )
+
+                        sensor_errors_text = ",".join(
+                            pedal["sensor_errors"]
+                        )
+
+                        print(
+                            f"[PEDAL] "
+                            f"ACC="
+                            f"{pedal['accelerator']}% "
+                            f"BRAKE="
+                            f"{pedal['brake']}% "
+                            f"ACC_RATE="
+                            f"{pedal['accelerator_rate']:.1f}%/s "
+                            f"BRAKE_RATE="
+                            f"{pedal['brake_rate']:.1f}%/s "
+                            f"STATUS="
+                            f"0x{pedal['sensor_status']:02X} "
+                            f"ERRORS="
+                            f"{sensor_errors_text} "
+                            f"ALIVE="
+                            f"{pedal['alive_counter']}"
+                        )
+
+                    except ValueError as error:
+                        print(
+                            "[PEDAL] "
+                            f"Invalid message: {error}"
+                        )
+
+                elif msg.arbitration_id == HAPTIC_STATUS_ID:
+                    try:
+                        haptic = decode_haptic_status(
+                            msg.data
+                        )
+
+                        state.update_haptic(
+                            haptic
+                        )
+
+                        haptic_timeout_reported = False
+
+                        print(
+                            f"[HAPTIC] "
+                            f"RISK="
+                            f"{haptic['risk_level']} "
+                            f"VIB="
+                            f"{haptic['vibration_status']} "
+                            f"INTENSITY="
+                            f"{haptic['intensity']}% "
+                            f"FREQ="
+                            f"{haptic['frequency']}Hz "
+                            f"FAULT="
+                            f"{haptic['fault_code']} "
+                            f"CMD_TIMEOUT="
+                            f"{haptic['command_timeout']} "
+                            f"ECU_STATUS="
+                            f"{haptic['ecu_status']} "
+                            f"ALIVE="
+                            f"{haptic['alive_counter']}"
+                        )
+
+                    except ValueError as error:
+                        print(
+                            "[HAPTIC] "
+                            f"Invalid message: {error}"
+                        )
+
                 try:
                     pedal = decode_pedal_status(
                         msg.data
@@ -205,7 +327,7 @@ def main():
                     )
 
             # -------------------------------------------------
-            # 2. Pedal timeout
+            # Pedal timeout
             # -------------------------------------------------
             if (
                 time.monotonic()
@@ -225,7 +347,30 @@ def main():
                     )
 
             # -------------------------------------------------
-            # 3. Receive data from ToF worker
+            # Haptic ECU freshness check
+            # -------------------------------------------------
+            was_haptic_connected = (
+                state.haptic_connected
+            )
+
+            state.check_haptic_freshness(
+                timeout=0.1
+            )
+
+            if (
+                was_haptic_connected
+                and not state.haptic_connected
+            ):
+                if not haptic_timeout_reported:
+                    print(
+                        "[HAPTIC] "
+                        "COMMUNICATION TIMEOUT"
+                    )
+
+                    haptic_timeout_reported = True
+
+            # -------------------------------------------------
+            # Receive data from ToF worker
             # -------------------------------------------------
             while True:
                 try:
@@ -283,7 +428,7 @@ def main():
                     )
 
             # -------------------------------------------------
-            # 4. Check ToF worker
+            # Check ToF worker
             # -------------------------------------------------
             if (
                 tof_process is None
@@ -322,7 +467,7 @@ def main():
                     )
 
             # -------------------------------------------------
-            # 5. Distance freshness check
+            # Distance freshness check
             # -------------------------------------------------
             was_distance_valid = (
                 state.distance_valid
@@ -356,7 +501,7 @@ def main():
                     )
 
             # -------------------------------------------------
-            # 6. BNS calculation
+            # BNS calculation
             # -------------------------------------------------
             state.bns = bns_calculator.calculate(
                 distance_cm=state.distance_cm,
@@ -366,7 +511,7 @@ def main():
             )
 
             # -------------------------------------------------
-            # 7. PMS calculation
+            # PMS calculation
             # -------------------------------------------------
             state.pms = pms_calculator.calculate(
                 accelerator=state.accelerator,
@@ -376,7 +521,7 @@ def main():
             )
 
             # -------------------------------------------------
-            # 8. Integrated risk evaluation
+            # Integrated risk evaluation
             # -------------------------------------------------
             (
                 state.total_risk,
@@ -389,7 +534,7 @@ def main():
             )
 
             # -------------------------------------------------
-            # 9. Fail-safe evaluation
+            # Fail-safe evaluation
             # -------------------------------------------------
             failsafe.evaluate(
                 state
@@ -424,7 +569,7 @@ def main():
                 )
 
             # -------------------------------------------------
-            # 10. Haptic / Motor command transmission
+            # Haptic / Motor command transmission
             # -------------------------------------------------
             current_time = time.monotonic()
 
@@ -506,7 +651,7 @@ def main():
                 ) % 256
 
             # -------------------------------------------------
-            # 11. State output
+            # State output
             # -------------------------------------------------
             if state.distance_valid:
                 print(
@@ -536,6 +681,14 @@ def main():
                     f"{state.risk_level} "
                     f"RISK_AVAILABLE="
                     f"{risk_manager.available}"
+                    f"HAPTIC_CONNECTED="
+                    f"{state.haptic_connected} "
+                    f"HAPTIC_AVAILABLE="
+                    f"{state.haptic_available} "
+                    f"HAPTIC_FAULT="
+                    f"{state.haptic_fault_code} "
+                    f"HAPTIC_CMD_TIMEOUT="
+                    f"{state.haptic_command_timeout}"
                 )
 
     except KeyboardInterrupt:

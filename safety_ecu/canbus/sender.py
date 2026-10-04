@@ -5,6 +5,7 @@ class CANSender:
     def __init__(self, channel="can0"):
         self.channel = channel
         self.bus = None
+        self.tx_error_reported = False
 
     def open(self):
         self.bus = can.Bus(
@@ -12,7 +13,7 @@ class CANSender:
             channel=self.channel,
         )
         print(f"[CAN] {self.channel} opened for TX")
-
+        
     def send(self, arbitration_id, data):
         if self.bus is None:
             raise RuntimeError("CAN bus is not opened")
@@ -23,7 +24,29 @@ class CANSender:
             is_extended_id=False,
         )
 
-        self.bus.send(message)
+        try:
+            self.bus.send(message)
+
+        except can.CanError as error:
+            if not self.tx_error_reported:
+                print(
+                    "[CAN TX] "
+                    f"TRANSMISSION ERROR: {error}"
+                )
+
+                self.tx_error_reported = True
+
+            return False
+
+        if self.tx_error_reported:
+            print(
+                "[CAN TX] "
+                "TRANSMISSION RECOVERED"
+            )
+
+            self.tx_error_reported = False
+
+        return True
 
     def send_haptic_command(
         self,
