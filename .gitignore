@@ -11,15 +11,13 @@ __pycache__/
 
 # Logs
 *.log
+*.csv
 
 # Runtime / temporary files
 *.tmp
 *.swp
+*.save
 
 # OS files
 .DS_Store
 Thumbs.db
-
-# Generated CSV logs
-*.csv
-*.save
