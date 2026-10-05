@@ -21,3 +21,10 @@ __pycache__/
 # OS files
 .DS_Store
 Thumbs.db
+
+# STM32CubeIDE build output
+**/Debug/
+**/Release/
+
+# STM32CubeIDE debug launch configuration
+*.launch
