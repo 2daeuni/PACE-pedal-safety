@@ -66,7 +66,7 @@ typedef struct
  * CAN Timing
  * ========================================================= */
 #define HAPTIC_STATUS_PERIOD_MS    10U
-#define HAPTIC_COMMAND_TIMEOUT_MS  50U
+#define HAPTIC_COMMAND_TIMEOUT_MS  100U
 
 /* =========================================================
  * Fault Code
@@ -484,7 +484,7 @@ static void HapticCommand_Process(void)
 /* =========================================================
  * HAPTIC_COMMAND Timeout
  *
- * 50 ms 이상 명령이 없으면 Fail-Safe OFF
+ * 100 ms 이상 명령이 없으면 Fail-Safe OFF
  * ========================================================= */
 static void HapticTimeout_Process(void)
 {
@@ -506,6 +506,7 @@ static void HapticTimeout_Process(void)
       HAPTIC_COMMAND_TIMEOUT_MS)
   {
     command_timeout = 1U;
+    current_risk_level = 0U;
 
     /*
      * Timeout 발생 시 딱 한 번만
@@ -692,13 +693,6 @@ void HAL_CAN_RxFifo0MsgPendingCallback(
 
 
 
-  /* HAPTIC_COMMAND 형식 자체는 정상적으로 수신됨 */
-  last_command_tick = HAL_GetTick();
-  command_received_once = 1U;
-  command_timeout = 0U;
-  timeout_stop_done = 0U;
-
-
   /*
    * Alive Counter 검사
    * 첫 정상 프레임은 수용하고, 이후 동일 값 반복 시 통신 이상 처리.
@@ -720,6 +714,12 @@ void HAL_CAN_RxFifo0MsgPendingCallback(
     /* 정상 명령 수신 시간은 갱신하지 않음 */
     return;
   }
+
+  /* Alive Counter 검사까지 통과한 정상 명령 */
+  last_command_tick = HAL_GetTick();
+  command_received_once = 1U;
+  command_timeout = 0U;
+  timeout_stop_done = 0U;
 
   previous_command_alive = cmd.alive_counter;
   alive_received_once = 1U;
@@ -809,7 +809,7 @@ int main(void)
   printf("HAPTIC_COMMAND  : 0x110\r\n");
   printf("HAPTIC_STATUS   : 0x200\r\n");
   printf("STATUS Period   : 10 ms\r\n");
-  printf("Command Timeout : 50 ms\r\n");
+  printf("Command Timeout : 100 ms\r\n");
   printf("========================================\r\n");
 
 
@@ -912,7 +912,7 @@ int main(void)
 
 
     /* =========================================================
-     * 2. 50 ms CAN Command Timeout 감시
+     * 2. 100 ms CAN Command Timeout 감시
      * ========================================================= */
     HapticTimeout_Process();
 
@@ -1151,7 +1151,7 @@ static void MX_CAN1_Init(void)
       DISABLE;
 
   hcan1.Init.AutoBusOff =
-      DISABLE;
+      ENABLE;
 
   hcan1.Init.AutoWakeUp =
       DISABLE;

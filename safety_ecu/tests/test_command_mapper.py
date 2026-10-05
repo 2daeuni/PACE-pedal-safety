@@ -161,13 +161,13 @@ def test_level_2():
 
     assert_equal(
         commands["haptic"]["intensity"],
-        60,
+        45,
         "Level 2 haptic intensity",
     )
 
     assert_equal(
         commands["haptic"]["frequency"],
-        35,
+        20,
         "Level 2 haptic frequency",
     )
 
@@ -203,13 +203,13 @@ def test_level_3():
 
     assert_equal(
         commands["haptic"]["intensity"],
-        100,
+        65,
         "Level 3 haptic intensity",
     )
 
     assert_equal(
         commands["haptic"]["frequency"],
-        50,
+        30,
         "Level 3 haptic frequency",
     )
 

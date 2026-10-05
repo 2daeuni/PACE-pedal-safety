@@ -70,8 +70,8 @@ class CommandMapper:
             return {
                 "haptic": {
                     "vibration_command": 1,
-                    "intensity": 60,
-                    "frequency": 35,
+                    "intensity": 45,
+                    "frequency": 20,
                 },
                 "motor": {
                     "control_mode": 0,
@@ -85,8 +85,8 @@ class CommandMapper:
             return {
                 "haptic": {
                     "vibration_command": 1,
-                    "intensity": 100,
-                    "frequency": 50,
+                    "intensity": 65,
+                    "frequency": 30,
                 },
                 "motor": {
                     "control_mode": 1,

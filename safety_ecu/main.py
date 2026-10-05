@@ -56,10 +56,15 @@ def main():
     sender = CANSender("can0")
 
     state = SystemState()
-    logger = PedalLogger("pedal_data.csv")
+
+    logger = PedalLogger(
+        "pedal_data.csv"
+    )
+
     system_logger = SystemLogger(
         "system_data.csv"
     )
+
     failsafe = FailSafeManager()
     command_mapper = CommandMapper()
 
@@ -71,7 +76,9 @@ def main():
     # Pedal communication monitoring
     # -------------------------------------------------
     previous_alive_counter = None
+
     last_pedal_time = time.monotonic()
+
     pedal_timeout_reported = False
 
     # -------------------------------------------------
@@ -83,7 +90,9 @@ def main():
     # ToF process
     # -------------------------------------------------
     tof_queue = multiprocessing.Queue()
+
     tof_process = None
+
     last_tof_restart_attempt = 0.0
 
     # -------------------------------------------------
@@ -106,30 +115,43 @@ def main():
     motor_alive_counter = 0
 
     try:
+        # -------------------------------------------------
+        # Open CAN
+        # -------------------------------------------------
         receiver.open()
         sender.open()
 
+        # -------------------------------------------------
+        # Start ToF worker
+        # -------------------------------------------------
         tof_process = start_tof_process(
             tof_queue
         )
 
         print("[Safety ECU] Started")
+
         print(
             "[Safety ECU] "
             "Waiting for PEDAL_STATUS..."
         )
 
         while True:
-            # -------------------------------------------------
+            # =================================================
             # CAN receive
-            # -------------------------------------------------
+            # =================================================
             msg = receiver.receive(
                 timeout=0.001
             )
 
             if msg is not None:
 
-                if msg.arbitration_id == PEDAL_STATUS_ID:
+                # ---------------------------------------------
+                # PEDAL_STATUS
+                # ---------------------------------------------
+                if (
+                    msg.arbitration_id
+                    == PEDAL_STATUS_ID
+                ):
                     try:
                         pedal = decode_pedal_status(
                             msg.data
@@ -209,7 +231,13 @@ def main():
                             f"Invalid message: {error}"
                         )
 
-                elif msg.arbitration_id == HAPTIC_STATUS_ID:
+                # ---------------------------------------------
+                # HAPTIC_STATUS
+                # ---------------------------------------------
+                elif (
+                    msg.arbitration_id
+                    == HAPTIC_STATUS_ID
+                ):
                     try:
                         haptic = decode_haptic_status(
                             msg.data
@@ -219,7 +247,9 @@ def main():
                             haptic
                         )
 
-                        haptic_timeout_reported = False
+                        haptic_timeout_reported = (
+                            False
+                        )
 
                         print(
                             f"[HAPTIC] "
@@ -247,88 +277,9 @@ def main():
                             f"Invalid message: {error}"
                         )
 
-                try:
-                    pedal = decode_pedal_status(
-                        msg.data
-                    )
-
-                    state.update_pedal(
-                        pedal
-                    )
-
-                    logger.log(
-                        state
-                    )
-
-                    last_pedal_time = (
-                        time.monotonic()
-                    )
-
-                    pedal_timeout_reported = (
-                        False
-                    )
-
-                    current_alive_counter = (
-                        pedal["alive_counter"]
-                    )
-
-                    if (
-                        previous_alive_counter
-                        is not None
-                    ):
-                        expected_alive_counter = (
-                            previous_alive_counter
-                            + 1
-                        ) % 256
-
-                        if (
-                            current_alive_counter
-                            != expected_alive_counter
-                        ):
-                            print(
-                                "[PEDAL] "
-                                "ALIVE COUNTER ERROR: "
-                                f"expected="
-                                f"{expected_alive_counter}, "
-                                f"received="
-                                f"{current_alive_counter}"
-                            )
-
-                    previous_alive_counter = (
-                        current_alive_counter
-                    )
-
-                    sensor_errors_text = ",".join(
-                        pedal["sensor_errors"]
-                    )
-
-                    print(
-                        f"[PEDAL] "
-                        f"ACC="
-                        f"{pedal['accelerator']}% "
-                        f"BRAKE="
-                        f"{pedal['brake']}% "
-                        f"ACC_RATE="
-                        f"{pedal['accelerator_rate']:.1f}%/s "
-                        f"BRAKE_RATE="
-                        f"{pedal['brake_rate']:.1f}%/s "
-                        f"STATUS="
-                        f"0x{pedal['sensor_status']:02X} "
-                        f"ERRORS="
-                        f"{sensor_errors_text} "
-                        f"ALIVE="
-                        f"{pedal['alive_counter']}"
-                    )
-
-                except ValueError as error:
-                    print(
-                        "[PEDAL] "
-                        f"Invalid message: {error}"
-                    )
-
-            # -------------------------------------------------
+            # =================================================
             # Pedal timeout
-            # -------------------------------------------------
+            # =================================================
             if (
                 time.monotonic()
                 - last_pedal_time
@@ -346,9 +297,9 @@ def main():
                         True
                     )
 
-            # -------------------------------------------------
+            # =================================================
             # Haptic ECU freshness check
-            # -------------------------------------------------
+            # =================================================
             was_haptic_connected = (
                 state.haptic_connected
             )
@@ -367,11 +318,13 @@ def main():
                         "COMMUNICATION TIMEOUT"
                     )
 
-                    haptic_timeout_reported = True
+                    haptic_timeout_reported = (
+                        True
+                    )
 
-            # -------------------------------------------------
+            # =================================================
             # Receive data from ToF worker
-            # -------------------------------------------------
+            # =================================================
             while True:
                 try:
                     tof_message = (
@@ -394,9 +347,9 @@ def main():
                     )
 
                 elif message_type == "distance":
-                    distance = tof_message[
-                        "distance_cm"
-                    ]
+                    distance = (
+                        tof_message["distance_cm"]
+                    )
 
                     state.update_distance(
                         distance
@@ -417,6 +370,7 @@ def main():
                         )
 
                     state.tof_connected = False
+
                     state.invalidate_distance()
 
                     print(
@@ -427,14 +381,15 @@ def main():
                         f"{state.distance_valid}"
                     )
 
-            # -------------------------------------------------
+            # =================================================
             # Check ToF worker
-            # -------------------------------------------------
+            # =================================================
             if (
                 tof_process is None
                 or not tof_process.is_alive()
             ):
                 state.tof_connected = False
+
                 state.invalidate_distance()
 
                 current_time = (
@@ -446,6 +401,7 @@ def main():
                     - last_tof_restart_attempt
                     >= 1.0
                 ):
+
                     last_tof_restart_attempt = (
                         current_time
                     )
@@ -466,9 +422,9 @@ def main():
                         )
                     )
 
-            # -------------------------------------------------
+            # =================================================
             # Distance freshness check
-            # -------------------------------------------------
+            # =================================================
             was_distance_valid = (
                 state.distance_valid
             )
@@ -500,42 +456,64 @@ def main():
                         True
                     )
 
-            # -------------------------------------------------
+            # =================================================
             # BNS calculation
-            # -------------------------------------------------
-            state.bns = bns_calculator.calculate(
-                distance_cm=state.distance_cm,
-                distance_valid=state.distance_valid,
-                vehicle_speed=state.vehicle_speed,
-                ttc=state.ttc,
+            # =================================================
+            state.bns = (
+                bns_calculator.calculate(
+                    distance_cm=(
+                        state.distance_cm
+                    ),
+                    distance_valid=(
+                        state.distance_valid
+                    ),
+                    vehicle_speed=(
+                        state.vehicle_speed
+                    ),
+                    ttc=state.ttc,
+                )
             )
 
-            # -------------------------------------------------
+            # =================================================
             # PMS calculation
-            # -------------------------------------------------
-            state.pms = pms_calculator.calculate(
-                accelerator=state.accelerator,
-                accelerator_rate=state.accelerator_rate,
-                pedal_connected=state.pedal_connected,
-                sensor_status=state.pedal_sensor_status,
+            # =================================================
+            state.pms = (
+                pms_calculator.calculate(
+                    accelerator=(
+                        state.accelerator
+                    ),
+                    accelerator_rate=(
+                        state.accelerator_rate
+                    ),
+                    pedal_connected=(
+                        state.pedal_connected
+                    ),
+                    sensor_status=(
+                        state.pedal_sensor_status
+                    ),
+                )
             )
 
-            # -------------------------------------------------
+            # =================================================
             # Integrated risk evaluation
-            # -------------------------------------------------
+            # =================================================
             (
                 state.total_risk,
                 state.risk_level,
             ) = risk_manager.evaluate(
                 bns=state.bns,
-                bns_available=bns_calculator.available,
+                bns_available=(
+                    bns_calculator.available
+                ),
                 pms=state.pms,
-                pms_available=pms_calculator.available,
+                pms_available=(
+                    pms_calculator.available
+                ),
             )
 
-            # -------------------------------------------------
+            # =================================================
             # Fail-safe evaluation
-            # -------------------------------------------------
+            # =================================================
             failsafe.evaluate(
                 state
             )
@@ -568,9 +546,9 @@ def main():
                     failsafe.reason
                 )
 
-            # -------------------------------------------------
+            # =================================================
             # Haptic / Motor command transmission
-            # -------------------------------------------------
+            # =================================================
             current_time = time.monotonic()
 
             if (
@@ -583,13 +561,24 @@ def main():
                 )
 
                 commands = command_mapper.map(
-                    risk_level=state.risk_level,
-                    risk_available=risk_manager.available,
-                    failsafe_active=failsafe.active,
+                    risk_level=(
+                        state.risk_level
+                    ),
+                    risk_available=(
+                        risk_manager.available
+                    ),
+                    failsafe_active=(
+                        failsafe.active
+                    ),
                 )
 
+                # ---------------------------------------------
+                # Haptic command
+                # ---------------------------------------------
                 sender.send_haptic_command(
-                    risk_level=state.risk_level,
+                    risk_level=(
+                        state.risk_level
+                    ),
                     vibration_command=(
                         commands["haptic"][
                             "vibration_command"
@@ -610,6 +599,9 @@ def main():
                     ),
                 )
 
+                # ---------------------------------------------
+                # Motor command
+                # ---------------------------------------------
                 sender.send_motor_command(
                     control_mode=(
                         commands["motor"][
@@ -621,7 +613,9 @@ def main():
                             "output_limit"
                         ]
                     ),
-                    risk_level=state.risk_level,
+                    risk_level=(
+                        state.risk_level
+                    ),
                     command_flags=(
                         commands["motor"][
                             "command_flags"
@@ -632,13 +626,26 @@ def main():
                     ),
                 )
 
+                # ---------------------------------------------
+                # System logger
+                # ---------------------------------------------
                 system_logger.log(
                     state=state,
-                    bns_available=bns_calculator.available,
-                    pms_available=pms_calculator.available,
-                    risk_available=risk_manager.available,
-                    failsafe_active=failsafe.active,
-                    failsafe_reason=failsafe.reason,
+                    bns_available=(
+                        bns_calculator.available
+                    ),
+                    pms_available=(
+                        pms_calculator.available
+                    ),
+                    risk_available=(
+                        risk_manager.available
+                    ),
+                    failsafe_active=(
+                        failsafe.active
+                    ),
+                    failsafe_reason=(
+                        failsafe.reason
+                    ),
                     commands=commands,
                 )
 
@@ -650,9 +657,9 @@ def main():
                     motor_alive_counter + 1
                 ) % 256
 
-            # -------------------------------------------------
+            # =================================================
             # State output
-            # -------------------------------------------------
+            # =================================================
             if state.distance_valid:
                 print(
                     f"[STATE] "
@@ -680,7 +687,7 @@ def main():
                     f"RISK_LEVEL="
                     f"{state.risk_level} "
                     f"RISK_AVAILABLE="
-                    f"{risk_manager.available}"
+                    f"{risk_manager.available} "
                     f"HAPTIC_CONNECTED="
                     f"{state.haptic_connected} "
                     f"HAPTIC_AVAILABLE="
@@ -697,6 +704,9 @@ def main():
         )
 
     finally:
+        # -------------------------------------------------
+        # Stop ToF worker
+        # -------------------------------------------------
         if (
             tof_process is not None
             and tof_process.is_alive()
