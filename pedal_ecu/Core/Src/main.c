@@ -26,11 +26,11 @@
   * 0x40 : Reserved
   * 0x80 : Reserved
   *
-  * Sensor disconnect policy:
-  *   PB0/PB1 Detect lines are NOT used.
-  *   PA0/PA1 internal pull-up/pull-down are NOT used.
-  *   Sensor Disconnect is detected using the experimentally
-  *   measured floating percentage pattern of this hardware.
+ * Sensor disconnect policy:
+ *   PB0/PB1 Detect lines are NOT used.
+ *   PA0/PA1 internal pull-up/pull-down are NOT used.
+ *   Percentage-based disconnect detection is disabled
+ *   because the floating value overlaps the normal pedal range.
   ******************************************************************************
   */
 /* USER CODE END Header */
@@ -80,27 +80,20 @@ UART_HandleTypeDef huart2;
 #define PEDAL_PERCENT_HYSTERESIS            2U
 
 
-/* ============================================================
- * SENSOR DISCONNECT PATTERN
+/*
+ * SENSOR DISCONNECT DIAGNOSTIC
  *
- * 실제 하드웨어 실측 결과를 기준으로 사용한다.
+ * 현재 하드웨어는 3선식 페달(+ / GND / Signal) 구조이며,
+ * 센서 단선 시 floating ADC 값이 정상 페달 입력 범위와
+ * 겹치는 현상이 확인되었다.
  *
- * A1(Accelerator signal) 분리:
- *   Accelerator = 29~31 %
+ * 따라서 percentage 기반 Disconnect 진단은
+ * false positive 방지를 위해 현재 버전에서는 비활성화한다.
  *
- * A0(Brake signal) 분리:
- *   Brake = 33~35 %
- *
- * A0 + A1 둘 다 분리:
- *   Accelerator = 76~77 %
- *   Brake       = 70~71 % (판정 여유: 69~72%)
- *
- * 약간의 측정 오차를 고려해 판정 범위를 조금 넓게 잡는다.
- *
- * IMPORTANT:
- * 이 방식은 현재 하드웨어의 floating 패턴을 이용한
- * 프로젝트용 진단 방식이다.
- * ============================================================ */
+ * 센서 이상 판단은 ADC Range Error,
+ * Calibration Error 및 Safety ECU의
+ * PEDAL_STATUS communication timeout을 사용한다.
+ */
 #define ACC_DISCONNECT_MIN_PERCENT          28U
 #define ACC_DISCONNECT_MAX_PERCENT          32U
 
@@ -685,146 +678,44 @@ static void Update_ADC_Range_Diagnostic(void)
     }
 }
 
-
-
 static void Update_Disconnect_Diagnostic(void)
 {
-    uint8_t acc_fault_pattern;
-    uint8_t brake_fault_pattern;
-
-    /* --------------------------------------------------------
-     * 현재 퍼센트에서 실측 단선 패턴 확인
-     * -------------------------------------------------------- */
-
-    /* A1 악셀 선 분리 실측: 약 29~31% */
-    acc_disconnect_pattern =
-        ((accel_percent >= ACC_DISCONNECT_MIN_PERCENT) &&
-         (accel_percent <= ACC_DISCONNECT_MAX_PERCENT))
-        ? 1U : 0U;
-
-    /* A0 브레이크 선 분리 실측: 약 33~35% */
-    brake_disconnect_pattern =
-        ((brake_percent >= BRAKE_DISCONNECT_MIN_PERCENT) &&
-         (brake_percent <= BRAKE_DISCONNECT_MAX_PERCENT))
-        ? 1U : 0U;
-
     /*
-     * A0 + A1 둘 다 분리 실측:
-     * Accelerator = 약 76~77%
-     * Brake       = 약 70~71%
+     * 현재 하드웨어는 3선식 페달(+ / GND / Signal) 구조이며,
+     * 센서 단선 시 floating 값이 정상 페달 영역과 겹칠 수 있다.
      *
-     * 실제 판정 범위는 작은 측정 흔들림을 고려해
-     * Accelerator 74~79%, Brake 69~72%로 둔다.
+     * 기존 방식:
+     *   Accelerator 28~32% -> Disconnect
+     *   Brake       32~36% -> Disconnect
+     *
+     * 문제:
+     *   정상 운전 중 동일한 퍼센트 영역을 유지할 경우
+     *   실제 단선이 아닌데도 Disconnect가 발생할 수 있다.
+     *
+     * 따라서 현재 버전에서는 percentage 기반 Disconnect 진단을
+     * 비활성화한다.
+     *
+     * 센서 이상은 다음 진단을 사용한다.
+     *   - ADC Range Error
+     *   - Calibration Error
+     *   - Safety ECU의 PEDAL_STATUS communication timeout
+     *
+     * 향후 별도 Detect 회로 / 센서 이중화 등을 적용하면
+     * 이 함수에서 Disconnect 진단을 다시 활성화한다.
      */
-    both_disconnect_pattern =
-        ((accel_percent >= BOTH_ACC_DISCONNECT_MIN_PERCENT) &&
-         (accel_percent <= BOTH_ACC_DISCONNECT_MAX_PERCENT) &&
-         (brake_percent >= BOTH_BRAKE_DISCONNECT_MIN_PERCENT) &&
-         (brake_percent <= BOTH_BRAKE_DISCONNECT_MAX_PERCENT))
-        ? 1U : 0U;
 
-    /*
-     * 이전 v3의 "15%p 이상 한 번에 급변해야 후보" 조건은 제거.
-     *
-     * 실제 ADC 필터 때문에 브레이크/양쪽 분리 시 값이
-     * 여러 10ms 주기에 걸쳐 단선 패턴으로 들어가면서
-     * jump 조건을 놓칠 수 있었기 때문이다.
-     *
-     * 최종 판정은 실측 패턴이 50ms 연속 유지되는지로 결정한다.
-     */
-    acc_fault_pattern =
-        ((acc_disconnect_pattern != 0U) ||
-         (both_disconnect_pattern != 0U))
-        ? 1U : 0U;
+    acc_disconnect_pattern = 0U;
+    brake_disconnect_pattern = 0U;
+    both_disconnect_pattern = 0U;
 
-    brake_fault_pattern =
-        ((brake_disconnect_pattern != 0U) ||
-         (both_disconnect_pattern != 0U))
-        ? 1U : 0U;
+    acc_disconnect_count = 0U;
+    brake_disconnect_count = 0U;
 
-    /* ========================================================
-     * Accelerator Disconnect
-     * 패턴 50ms 연속 -> Error ON
-     * 정상 100ms 연속 -> Error OFF
-     * ======================================================== */
-    if (acc_fault_pattern != 0U)
-    {
-        acc_disconnect_recovery_count = 0U;
+    acc_disconnect_recovery_count = 0U;
+    brake_disconnect_recovery_count = 0U;
 
-        if (acc_disconnect_count < DISCONNECT_CONFIRM_COUNT)
-        {
-            acc_disconnect_count++;
-        }
-
-        if (acc_disconnect_count >= DISCONNECT_CONFIRM_COUNT)
-        {
-            acc_disconnect_active = 1U;
-        }
-    }
-    else
-    {
-        acc_disconnect_count = 0U;
-
-        if (acc_disconnect_active != 0U)
-        {
-            if (acc_disconnect_recovery_count < DISCONNECT_RECOVERY_COUNT)
-            {
-                acc_disconnect_recovery_count++;
-            }
-
-            if (acc_disconnect_recovery_count >= DISCONNECT_RECOVERY_COUNT)
-            {
-                acc_disconnect_active = 0U;
-                acc_disconnect_recovery_count = 0U;
-            }
-        }
-        else
-        {
-            acc_disconnect_recovery_count = 0U;
-        }
-    }
-
-    /* ========================================================
-     * Brake Disconnect
-     * 패턴 50ms 연속 -> Error ON
-     * 정상 100ms 연속 -> Error OFF
-     * ======================================================== */
-    if (brake_fault_pattern != 0U)
-    {
-        brake_disconnect_recovery_count = 0U;
-
-        if (brake_disconnect_count < DISCONNECT_CONFIRM_COUNT)
-        {
-            brake_disconnect_count++;
-        }
-
-        if (brake_disconnect_count >= DISCONNECT_CONFIRM_COUNT)
-        {
-            brake_disconnect_active = 1U;
-        }
-    }
-    else
-    {
-        brake_disconnect_count = 0U;
-
-        if (brake_disconnect_active != 0U)
-        {
-            if (brake_disconnect_recovery_count < DISCONNECT_RECOVERY_COUNT)
-            {
-                brake_disconnect_recovery_count++;
-            }
-
-            if (brake_disconnect_recovery_count >= DISCONNECT_RECOVERY_COUNT)
-            {
-                brake_disconnect_active = 0U;
-                brake_disconnect_recovery_count = 0U;
-            }
-        }
-        else
-        {
-            brake_disconnect_recovery_count = 0U;
-        }
-    }
+    acc_disconnect_active = 0U;
+    brake_disconnect_active = 0U;
 }
 
 static void Update_Sensor_Status(void)
@@ -843,9 +734,9 @@ static void Update_Sensor_Status(void)
     }
 
     /* --------------------------------------------------------
-     * Sensor Disconnect
-     * 현재 하드웨어에서 실측한 floating 패턴 기반
-     * -------------------------------------------------------- */
+    * Sensor Disconnect
+    * 현재 버전에서는 percentage 기반 진단 비활성화
+    * -------------------------------------------------------- */
     if (acc_disconnect_active != 0U)
     {
         status |= 0x04U;
