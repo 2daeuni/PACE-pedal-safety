@@ -79,40 +79,6 @@ UART_HandleTypeDef huart2;
 #define PEDAL_FULL_DEADZONE_PERCENT       98U
 #define PEDAL_PERCENT_HYSTERESIS            2U
 
-
-/*
- * SENSOR DISCONNECT DIAGNOSTIC
- *
- * 현재 하드웨어는 3선식 페달(+ / GND / Signal) 구조이며,
- * 센서 단선 시 floating ADC 값이 정상 페달 입력 범위와
- * 겹치는 현상이 확인되었다.
- *
- * 따라서 percentage 기반 Disconnect 진단은
- * false positive 방지를 위해 현재 버전에서는 비활성화한다.
- *
- * 센서 이상 판단은 ADC Range Error,
- * Calibration Error 및 Safety ECU의
- * PEDAL_STATUS communication timeout을 사용한다.
- */
-#define ACC_DISCONNECT_MIN_PERCENT          28U
-#define ACC_DISCONNECT_MAX_PERCENT          32U
-
-#define BRAKE_DISCONNECT_MIN_PERCENT        32U
-#define BRAKE_DISCONNECT_MAX_PERCENT        36U
-
-#define BOTH_ACC_DISCONNECT_MIN_PERCENT     74U
-#define BOTH_ACC_DISCONNECT_MAX_PERCENT     79U
-
-#define BOTH_BRAKE_DISCONNECT_MIN_PERCENT   69U
-#define BOTH_BRAKE_DISCONNECT_MAX_PERCENT   72U
-
-/* 10 ms x 5 = 50 ms 동안 패턴이 지속되면 Disconnect 확정 */
-#define DISCONNECT_CONFIRM_COUNT             5U
-
-/* 정상 패턴이 10 ms x 10 = 100 ms 지속되면 Disconnect 해제 */
-#define DISCONNECT_RECOVERY_COUNT           10U
-
-
 /* ============================================================
  * ADC Range Error
  *
@@ -160,21 +126,8 @@ static uint8_t accel_percent_stable = 0U;
 static uint8_t brake_percent_stable = 0U;
 static uint8_t percent_filter_initialized = 0U;
 
-
-/* Sensor Disconnect 진단 상태 */
 volatile uint8_t acc_disconnect_active = 0U;
 volatile uint8_t brake_disconnect_active = 0U;
-
-static uint8_t acc_disconnect_count = 0U;
-static uint8_t brake_disconnect_count = 0U;
-
-static uint8_t acc_disconnect_recovery_count = 0U;
-static uint8_t brake_disconnect_recovery_count = 0U;
-
-static uint8_t acc_disconnect_pattern = 0U;
-static uint8_t brake_disconnect_pattern = 0U;
-static uint8_t both_disconnect_pattern = 0U;
-
 
 volatile int16_t accel_rate_raw = 0;
 volatile int16_t brake_rate_raw = 0;
@@ -209,12 +162,6 @@ volatile uint8_t debug_alive_counter = 0U;
 volatile uint8_t debug_acc_adc_range_error = 0U;
 volatile uint8_t debug_brake_adc_range_error = 0U;
 
-volatile uint8_t debug_acc_disconnect = 0U;
-volatile uint8_t debug_brake_disconnect = 0U;
-volatile uint8_t debug_acc_disconnect_pattern = 0U;
-volatile uint8_t debug_brake_disconnect_pattern = 0U;
-volatile uint8_t debug_both_disconnect_pattern = 0U;
-
 static uint32_t last_pedal_tick = 0U;
 static uint32_t last_debug_tick = 0U;
 
@@ -247,7 +194,6 @@ static uint16_t ADC_To_TenthPercent(uint16_t adc_value,
 static int16_t Saturate_Int16(int32_t value);
 static void Calculate_Pedal_Data(void);
 static void Update_ADC_Range_Diagnostic(void);
-static void Update_Disconnect_Diagnostic(void);
 static void Update_Sensor_Status(void);
 static void Send_Pedal_CAN(void);
 static void Pedal_ECU_10ms_Task(void);
@@ -678,46 +624,6 @@ static void Update_ADC_Range_Diagnostic(void)
     }
 }
 
-static void Update_Disconnect_Diagnostic(void)
-{
-    /*
-     * 현재 하드웨어는 3선식 페달(+ / GND / Signal) 구조이며,
-     * 센서 단선 시 floating 값이 정상 페달 영역과 겹칠 수 있다.
-     *
-     * 기존 방식:
-     *   Accelerator 28~32% -> Disconnect
-     *   Brake       32~36% -> Disconnect
-     *
-     * 문제:
-     *   정상 운전 중 동일한 퍼센트 영역을 유지할 경우
-     *   실제 단선이 아닌데도 Disconnect가 발생할 수 있다.
-     *
-     * 따라서 현재 버전에서는 percentage 기반 Disconnect 진단을
-     * 비활성화한다.
-     *
-     * 센서 이상은 다음 진단을 사용한다.
-     *   - ADC Range Error
-     *   - Calibration Error
-     *   - Safety ECU의 PEDAL_STATUS communication timeout
-     *
-     * 향후 별도 Detect 회로 / 센서 이중화 등을 적용하면
-     * 이 함수에서 Disconnect 진단을 다시 활성화한다.
-     */
-
-    acc_disconnect_pattern = 0U;
-    brake_disconnect_pattern = 0U;
-    both_disconnect_pattern = 0U;
-
-    acc_disconnect_count = 0U;
-    brake_disconnect_count = 0U;
-
-    acc_disconnect_recovery_count = 0U;
-    brake_disconnect_recovery_count = 0U;
-
-    acc_disconnect_active = 0U;
-    brake_disconnect_active = 0U;
-}
-
 static void Update_Sensor_Status(void)
 {
     uint8_t status = 0x00U;
@@ -815,7 +721,6 @@ static void Pedal_ECU_10ms_Task(void)
     Read_Pedal_ADC();
     Calculate_Pedal_Data();
     Update_ADC_Range_Diagnostic();
-    Update_Disconnect_Diagnostic();
     Update_Sensor_Status();
     Send_Pedal_CAN();
 }
@@ -839,13 +744,6 @@ static void Update_Debug_Variables(void)
 
     debug_acc_adc_range_error = acc_adc_range_error_active;
     debug_brake_adc_range_error = brake_adc_range_error_active;
-
-    debug_acc_disconnect = acc_disconnect_active;
-    debug_brake_disconnect = brake_disconnect_active;
-
-    debug_acc_disconnect_pattern = acc_disconnect_pattern;
-    debug_brake_disconnect_pattern = brake_disconnect_pattern;
-    debug_both_disconnect_pattern = both_disconnect_pattern;
 }
 
 /* Main ----------------------------------------------------------------------*/
