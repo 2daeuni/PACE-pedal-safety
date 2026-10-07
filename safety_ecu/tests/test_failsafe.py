@@ -50,8 +50,8 @@ def test_normal_state():
     failsafe = FailSafeManager()
 
     state.tof_connected = True
-    state.pedal_connected = False
-    state.pedal_sensor_status = None
+    state.pedal_connected = True
+    state.pedal_sensor_status = 0x00
 
     active = failsafe.evaluate(state)
 
@@ -95,32 +95,38 @@ def test_pedal_sensor_error():
     print("[PASS] Pedal sensor error")
 
 
-def test_pedal_disconnected_not_yet_failsafe():
+def test_pedal_disconnected_failsafe():
     state = SystemState()
     failsafe = FailSafeManager()
 
     state.tof_connected = True
     state.pedal_connected = False
-    state.pedal_sensor_status = None
 
     active = failsafe.evaluate(state)
 
     assert_equal(
         active,
-        False,
-        "Pedal disconnect should not activate fail-safe yet",
+        True,
+        "Pedal disconnect should activate fail-safe",
     )
 
-    print("[PASS] Pedal disconnect currently ignored")
+    assert_equal(
+        failsafe.reason,
+        "PEDAL_COMMUNICATION_ERROR",
+        "Wrong fail-safe reason for Pedal communication failure",
+    )
+
+    print("[PASS] Pedal communication fail-safe")
 
 
 def test_recovery():
     state = SystemState()
     failsafe = FailSafeManager()
 
+    # Start with fail-safe active
     state.tof_connected = False
-    state.pedal_connected = False
-    state.pedal_sensor_status = None
+    state.pedal_connected = True
+    state.pedal_sensor_status = 0x00
 
     failsafe.evaluate(state)
 
@@ -130,7 +136,10 @@ def test_recovery():
         "Fail-safe activation before recovery failed",
     )
 
+    # Recover all fault conditions
     state.tof_connected = True
+    state.pedal_connected = True
+    state.pedal_sensor_status = 0x00
 
     failsafe.evaluate(state)
 
@@ -148,14 +157,13 @@ def test_recovery():
 
     print("[PASS] Fail-safe recovery")
 
-
 def run_all_tests():
     print("=== FailSafeManager Tests ===")
 
     test_tof_failure()
     test_normal_state()
     test_pedal_sensor_error()
-    test_pedal_disconnected_not_yet_failsafe()
+    test_pedal_disconnected_failsafe()
     test_recovery()
 
     print("=============================")

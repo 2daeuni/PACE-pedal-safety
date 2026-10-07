@@ -12,6 +12,13 @@ class FailSafeManager:
 
             return self.active
 
+        # Pedal communication failure
+        if not state.pedal_connected:
+            self.active = True
+            self.reason = "PEDAL_COMMUNICATION_ERROR"
+
+            return self.active
+
         # Pedal sensor error
         #
         # Only evaluate Sensor Status while the

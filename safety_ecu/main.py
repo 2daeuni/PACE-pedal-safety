@@ -76,6 +76,7 @@ def main():
     # Pedal communication monitoring
     # -------------------------------------------------
     previous_alive_counter = None
+    recovery_alive_candidate = None
 
     last_pedal_time = time.monotonic()
 
@@ -157,73 +158,144 @@ def main():
                             msg.data
                         )
 
-                        state.update_pedal(
-                            pedal
-                        )
-
-                        logger.log(
-                            state
-                        )
-
-                        last_pedal_time = (
-                            time.monotonic()
-                        )
-
-                        pedal_timeout_reported = (
-                            False
-                        )
-
                         current_alive_counter = (
                             pedal["alive_counter"]
                         )
 
-                        if (
-                            previous_alive_counter
-                            is not None
-                        ):
-                            expected_alive_counter = (
-                                previous_alive_counter
-                                + 1
-                            ) % 256
+                        alive_valid = False
 
+                        if not state.pedal_connected:
                             if (
-                                current_alive_counter
-                                != expected_alive_counter
+                                recovery_alive_candidate
+                                is None
                             ):
-                                print(
-                                    "[PEDAL] "
-                                    "ALIVE COUNTER ERROR: "
-                                    f"expected="
-                                    f"{expected_alive_counter}, "
-                                    f"received="
-                                    f"{current_alive_counter}"
+                                recovery_alive_candidate = (
+                                    current_alive_counter
                                 )
 
-                        previous_alive_counter = (
-                            current_alive_counter
-                        )
+                            else:
+                                expected_recovery = (
+                                    recovery_alive_candidate
+                                    + 1
+                                ) & 0xFF
 
-                        sensor_errors_text = ",".join(
-                            pedal["sensor_errors"]
-                        )
+                                if (
+                                    current_alive_counter
+                                    == expected_recovery
+                                ):
+                                    alive_valid = True
 
-                        print(
-                            f"[PEDAL] "
-                            f"ACC="
-                            f"{pedal['accelerator']}% "
-                            f"BRAKE="
-                            f"{pedal['brake']}% "
-                            f"ACC_RATE="
-                            f"{pedal['accelerator_rate']:.1f}%/s "
-                            f"BRAKE_RATE="
-                            f"{pedal['brake_rate']:.1f}%/s "
-                            f"STATUS="
-                            f"0x{pedal['sensor_status']:02X} "
-                            f"ERRORS="
-                            f"{sensor_errors_text} "
-                            f"ALIVE="
-                            f"{pedal['alive_counter']}"
-                        )
+                                    previous_alive_counter = (
+                                        current_alive_counter
+                                    )
+
+                                    recovery_alive_candidate = (
+                                        None
+                                    )
+
+                                else:
+                                    print(
+                                        "[PEDAL] "
+                                        "ALIVE RECOVERY WAIT: "
+                                        f"expected="
+                                        f"{expected_recovery}, "
+                                        f"received="
+                                        f"{current_alive_counter}"
+                                    )
+
+                                    recovery_alive_candidate = (
+                                        current_alive_counter
+                                    )
+
+                        else:
+                            alive_valid = True
+
+                            if (
+                                previous_alive_counter
+                                is not None
+                            ):
+                                delta = (
+                                    current_alive_counter
+                                    - previous_alive_counter
+                                ) & 0xFF
+
+                                expected_alive_counter = (
+                                    previous_alive_counter
+                                    + 1
+                                ) & 0xFF
+
+                                if delta == 0:
+                                    alive_valid = False
+
+                                    print(
+                                        "[PEDAL] "
+                                        "ALIVE COUNTER DUPLICATE: "
+                                        f"expected="
+                                        f"{expected_alive_counter}, "
+                                        f"received="
+                                        f"{current_alive_counter}"
+                                    )
+
+                                elif 2 <= delta < 128:
+                                    print(
+                                        "[PEDAL] "
+                                        "ALIVE COUNTER SKIP: "
+                                        f"expected="
+                                        f"{expected_alive_counter}, "
+                                        f"received="
+                                        f"{current_alive_counter}, "
+                                        f"missed="
+                                        f"{delta - 1}"
+                                    )
+
+                                elif delta >= 128:
+                                    alive_valid = False
+
+                                    print(
+                                        "[PEDAL] "
+                                        "ALIVE COUNTER BACKWARD: "
+                                        f"expected="
+                                        f"{expected_alive_counter}, "
+                                        f"received="
+                                        f"{current_alive_counter}"
+                                    )
+
+                            if alive_valid:
+                                previous_alive_counter = (
+                                    current_alive_counter
+                                )
+
+                        if alive_valid:
+                            state.update_pedal(
+                                pedal
+                            )
+
+                            logger.log(
+                                state
+                            )
+
+                            last_pedal_time = (
+                                time.monotonic()
+                            )
+
+                            pedal_timeout_reported = (
+                                False
+                            )
+
+                            sensor_errors_text = ",".join(
+                                pedal["sensor_errors"]
+                            )
+
+                            print(
+                                f"[PEDAL] "
+                                f"ACC={pedal['accelerator']}% "
+                                f"BRAKE={pedal['brake']}% "
+                                f"ACC_RATE={pedal['accelerator_rate']:.1f}%/s "
+                                f"BRAKE_RATE={pedal['brake_rate']:.1f}%/s "
+                                f"STATUS=0x{pedal['sensor_status']:02X} "
+                                f"ERRORS={sensor_errors_text} "
+                                f"ALIVE={pedal['alive_counter']}"
+                            )
 
                     except ValueError as error:
                         print(
@@ -292,6 +364,8 @@ def main():
                         "[PEDAL] "
                         "COMMUNICATION TIMEOUT"
                     )
+
+                    recovery_alive_candidate = None
 
                     pedal_timeout_reported = (
                         True
