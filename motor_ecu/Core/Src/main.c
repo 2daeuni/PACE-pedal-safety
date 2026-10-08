@@ -2,31 +2,92 @@
 /**
   ******************************************************************************
   * @file           : main.c
-  * @brief          : FINAL Motor ECU
+  * @brief          : FINAL Motor ECU - NUCLEO-F446RE
   *
+  * ============================= HARDWARE ====================================
   * Board           : NUCLEO-F446RE
   *
-  * CAN bus         : CAN1, 500 kbps
-  * CAN1_RX         : PA11
-  * CAN1_TX         : PA12
+  * ESC PWM
+  *   PA8 / TIM1_CH1
+  *   50 Hz
+  *   Neutral        : 1500 us
+  *   Drive range    : 1600 ~ 1800 us
   *
-  * ESC PWM         : PA8 / TIM1_CH1
-  * PWM frequency   : 50 Hz
-  * Neutral         : 1500 us
+  * CAN1
+  *   PA11           : CAN1_RX
+  *   PA12           : CAN1_TX
+  *   Bitrate        : 500 kbps
   *
-  * CAN IDs
-  * 0x100 : Pedal ECU  -> CAN bus
-  * 0x120 : Safety ECU -> Motor ECU
-  * 0x210 : Motor ECU  -> Safety/UI status
+  * ============================== CAN ========================================
+  * 0x100 PEDAL_STATUS : Pedal ECU -> Motor ECU
+  *   B0 Accelerator [%]             0~100
+  *   B1 Brake [%]                   0~100
+  *   B2~3 Accel rate                int16 LE
+  *   B4~5 Brake rate                int16 LE
+  *   B6 Sensor Status               0x00 = Normal
+  *   B7 Alive Counter
   *
-  * IMPORTANT
-  * - Motor ECU requires BOTH Pedal ECU and Safety ECU messages.
-  * - Any timeout/fault/brake/E-STOP forces ESC Neutral immediately.
+  * 0x120 MOTOR_COMMAND : Raspberry Pi Safety ECU -> Motor ECU
+  *   B0 Control Mode
+  *      0x00 Normal
+  *      0x01 Output Limit
+  *      0x02 Motor Stop
+  *   B1 Output Limit [%]            0~100
+  *   B2 Risk Level                  0~3
+  *   B3 Command Flags
+  *      bit0 Command Valid
+  *      bit1 Emergency Stop
+  *      bit2~7 Reserved
+  *   B4~6 Reserved                  0x00
+  *   B7 Alive Counter
+  *
+  * 0x210 MOTOR_STATUS : Motor ECU -> Raspberry Pi Safety ECU
+  *   B0 Actual PWM [%]              0~100
+  *   B1 Applied Output Limit [%]    0~100
+  *   B2~3 Vehicle Speed             uint16 LE, 0.01 m/s/bit
+  *                                  0xFFFF = Invalid / unavailable
+  *   B4 Motor State
+  *      0x00 Stop
+  *      0x01 Running
+  *      0x02 Output Limited
+  *      0x03 Fault
+  *   B5 Fault Flags
+  *      bit0 Motor Driver Fault
+  *      bit1 PEDAL_STATUS Timeout
+  *      bit2 MOTOR_COMMAND Timeout
+  *      bit3 Emergency Stop Active
+  *      bit4~7 Reserved
+  *   B6 Applied Command Counter
+  *   B7 Alive Counter
+  *
+  * ============================= CONTROL =====================================
+  * Normal:
+  *   Final Output = Accelerator
+  *
+  * Output Limit:
+  *   Final Output = min(Accelerator, Output Limit)
+  *
+  * Motor Stop:
+  *   Final Output = 0
+  *
+  * Emergency Stop:
+  *   Final Output = 0 while MOTOR_COMMAND Byte3 bit1 = 1
+  *
+  * Brake >= 5%:
+  *   Final Output = 0
+  *
+  * PEDAL_STATUS / MOTOR_COMMAND timeout:
+  *   Final Output = 0
+  *
+  * IMPORTANT:
+  *   Startup 5-second 1500 us neutral hold has been removed.
+  *   CAN and PWM start immediately, then normal control logic takes over.
   ******************************************************************************
   */
 /* USER CODE END Header */
 
 #include "main.h"
+#include "stm32f4xx_hal_can.h"
 
 /* Private variables ---------------------------------------------------------*/
 CAN_HandleTypeDef hcan1;
@@ -37,168 +98,82 @@ void SystemClock_Config(void);
 static void MX_GPIO_Init(void);
 static void MX_CAN1_Init(void);
 static void MX_TIM1_Init(void);
-void HAL_TIM_MspPostInit(TIM_HandleTypeDef *htim);
 void Error_Handler(void);
 
 /* USER CODE BEGIN PV */
 
-/* ========================================================================== */
-/* CAN ID / PERIOD                                                            */
-/* ========================================================================== */
-
+/* ==========================================================================
+ * CAN IDs
+ * ========================================================================== */
 #define CAN_ID_PEDAL_STATUS              0x100U
-#define CAN_ID_SAFETY_MOTOR_CMD          0x120U
+#define CAN_ID_MOTOR_COMMAND             0x120U
 #define CAN_ID_MOTOR_STATUS              0x210U
 
-#define PEDAL_EXPECTED_PERIOD_MS         10U
-#define SAFETY_EXPECTED_PERIOD_MS        20U
-#define MOTOR_STATUS_PERIOD_MS           20U
-
+/* ==========================================================================
+ * Timing
+ * ========================================================================== */
 #define PEDAL_TIMEOUT_MS                 200U
-#define SAFETY_TIMEOUT_MS                200U
+#define MOTOR_COMMAND_TIMEOUT_MS         200U
 #define ALIVE_STUCK_TIMEOUT_MS           200U
 
-/* ========================================================================== */
-/* PEDAL ECU : 0x100 / DLC 8                                                  */
-/* ========================================================================== */
-/*
- * Byte 0 : Accelerator [%]            uint8_t, 0~100
- * Byte 1 : Brake [%]                  uint8_t, 0~100
- * Byte 2 : Accel rate LSB             int16 little-endian, 0.1 %/s
- * Byte 3 : Accel rate MSB
- * Byte 4 : Brake rate LSB             int16 little-endian, 0.1 %/s
- * Byte 5 : Brake rate MSB
- * Byte 6 : Sensor Status
- * Byte 7 : Alive Counter
- *
- * Sensor Status
- * 0x01 : Normal
- * 0x02 : Accelerator ADC range error
- * 0x04 : Brake ADC range error
- * 0x08 : Accelerator disconnected
- * 0x10 : Brake disconnected
- * 0x20 : Accelerator calibration error
- * 0x40 : Brake calibration error
- * 0x80 : Reserved
- */
+#define MOTOR_CONTROL_PERIOD_MS          10U
+#define MOTOR_STATUS_PERIOD_MS           10U
 
-#define PEDAL_STATUS_NORMAL              0x01U
-
-/* ========================================================================== */
-/* SAFETY ECU -> MOTOR ECU : 0x120 / DLC 8                                    */
-/* ========================================================================== */
-/*
- * Byte 0 : Command
- *          0x00 STOP
- *          0x01 DRIVE_ALLOW
- *          0x02 BRAKE
- *          0x03 EMERGENCY_STOP
- *          0x04 CLEAR_ESTOP
- *
- * Byte 1 : Output limit [%]            0~100
- *          Final motor demand = MIN(Pedal accelerator, Output limit)
- *
- * Byte 2 : Safety Status
- *          0x01 = Normal
- *          Other = Fault -> Motor STOP
- *
- * Byte 3 : Safety Alive Counter
- *
- * Byte 4 : Safety Level
- *          0 = Normal
- *          1 = Warning
- *          2 = Intervention
- *          3 = Emergency
- *
- * Byte 5 : Reason Code                 Safety ECU-defined reason
- * Byte 6 : Reserved                    0
- * Byte 7 : Reserved                    0
- */
-
-#define SAFETY_CMD_STOP                  0x00U
-#define SAFETY_CMD_DRIVE_ALLOW           0x01U
-#define SAFETY_CMD_BRAKE                 0x02U
-#define SAFETY_CMD_EMERGENCY_STOP        0x03U
-#define SAFETY_CMD_CLEAR_ESTOP           0x04U
-
-#define SAFETY_STATUS_NORMAL             0x01U
-
-/* ========================================================================== */
-/* MOTOR ECU -> SAFETY/UI : 0x210 / DLC 8                                     */
-/* ========================================================================== */
-/*
- * Byte 0 : Motor State
- *          0 STOP
- *          1 DRIVE
- *          2 BRAKE
- *          3 ESTOP
- *          4 FAULT
- *
- * Byte 1 : Pedal accelerator [%]
- * Byte 2 : Applied motor output [%]
- * Byte 3 : Pedal sensor status
- * Byte 4 : Safety command
- * Byte 5 : Safety status
- * Byte 6 : Motor fault flags
- * Byte 7 : Motor ECU alive counter
- *
- * Motor Fault Flags
- * bit0 0x01 : Pedal CAN timeout
- * bit1 0x02 : Safety CAN timeout
- * bit2 0x04 : Pedal alive stuck
- * bit3 0x08 : Safety alive stuck
- * bit4 0x10 : Pedal sensor fault
- * bit5 0x20 : Safety status fault
- * bit6 0x40 : Emergency stop latched
- * bit7 0x80 : Reserved
- */
-
-#define MOTOR_STATE_STOP                 0U
-#define MOTOR_STATE_DRIVE                1U
-#define MOTOR_STATE_BRAKE                2U
-#define MOTOR_STATE_ESTOP                3U
-#define MOTOR_STATE_FAULT                4U
-
-#define MOTOR_FAULT_PEDAL_TIMEOUT        0x01U
-#define MOTOR_FAULT_SAFETY_TIMEOUT       0x02U
-#define MOTOR_FAULT_PEDAL_ALIVE          0x04U
-#define MOTOR_FAULT_SAFETY_ALIVE         0x08U
-#define MOTOR_FAULT_PEDAL_STATUS         0x10U
-#define MOTOR_FAULT_SAFETY_STATUS        0x20U
-#define MOTOR_FAULT_ESTOP_LATCHED        0x40U
-
-/* ========================================================================== */
-/* MOTOR / ESC                                                                */
-/* ========================================================================== */
+/* ==========================================================================
+ * PEDAL_STATUS
+ * ========================================================================== */
+#define PEDAL_STATUS_NORMAL              0x00U
 
 #define ACCEL_DEADBAND_PERCENT           3U
 #define BRAKE_THRESHOLD_PERCENT          5U
 
-#define ESC_NEUTRAL_US                   1500U
+/* ==========================================================================
+ * MOTOR_COMMAND
+ * ========================================================================== */
+#define MOTOR_MODE_NORMAL                0x00U
+#define MOTOR_MODE_OUTPUT_LIMIT          0x01U
+#define MOTOR_MODE_STOP                  0x02U
 
-/*
- * 실제 차량 ESC dead-band를 고려한 구동 시작값.
- * 차량이 1600 us에서 돌지 않고 1700 us부터 돌면
- * ESC_DRIVE_MIN_US만 1700U로 변경.
- */
+#define MOTOR_CMD_FLAG_VALID             0x01U
+#define MOTOR_CMD_FLAG_ESTOP             0x02U
+#define MOTOR_CMD_FLAG_ALLOWED_MASK      0x03U
+
+/* ==========================================================================
+ * MOTOR_STATUS - Motor State
+ * ========================================================================== */
+#define MOTOR_STATE_STOP                 0x00U
+#define MOTOR_STATE_RUNNING              0x01U
+#define MOTOR_STATE_OUTPUT_LIMITED       0x02U
+#define MOTOR_STATE_FAULT                0x03U
+
+/* ==========================================================================
+ * MOTOR_STATUS - Fault Flags
+ * ========================================================================== */
+#define MOTOR_FAULT_DRIVER               0x01U
+#define MOTOR_FAULT_PEDAL_TIMEOUT        0x02U
+#define MOTOR_FAULT_COMMAND_TIMEOUT      0x04U
+#define MOTOR_FAULT_ESTOP_ACTIVE         0x08U
+
+/* ==========================================================================
+ * ESC
+ * ========================================================================== */
+#define ESC_NEUTRAL_US                   1500U
 #define ESC_DRIVE_MIN_US                 1600U
 #define ESC_DRIVE_MAX_US                 1800U
-
 #define ESC_ABSOLUTE_MIN_US              1000U
 #define ESC_ABSOLUTE_MAX_US              2000U
 
-#define MOTOR_CONTROL_PERIOD_MS          10U
-#define ESC_RAMP_STEP_US                 5U
+/* 10 us per 10 ms control cycle */
+#define ESC_RAMP_STEP_US                 10U
 
-/* ========================================================================== */
-/* RECEIVED PEDAL DATA                                                        */
-/* ========================================================================== */
-
+/* ==========================================================================
+ * PEDAL RX
+ * ========================================================================== */
 volatile uint8_t  pedal_accel = 0U;
 volatile uint8_t  pedal_brake = 0U;
 volatile int16_t  pedal_accel_rate = 0;
 volatile int16_t  pedal_brake_rate = 0;
-volatile uint8_t  pedal_status = 0x00U;
+volatile uint8_t  pedal_sensor_status = 0xFFU;
 volatile uint8_t  pedal_alive = 0U;
 
 volatile uint8_t  pedal_received = 0U;
@@ -208,64 +183,70 @@ volatile uint8_t  pedal_previous_alive = 0U;
 volatile uint32_t pedal_last_rx_tick = 0U;
 volatile uint32_t pedal_last_alive_change_tick = 0U;
 
-/* ========================================================================== */
-/* RECEIVED SAFETY DATA                                                       */
-/* ========================================================================== */
+/* ==========================================================================
+ * MOTOR_COMMAND RX
+ * ========================================================================== */
+volatile uint8_t command_mode = MOTOR_MODE_STOP;
+volatile uint8_t command_output_limit = 0U;
+volatile uint8_t command_risk_level = 0U;
+volatile uint8_t command_flags = 0U;
+volatile uint8_t command_alive = 0U;
 
-volatile uint8_t safety_command = SAFETY_CMD_STOP;
-volatile uint8_t safety_output_limit = 0U;
-volatile uint8_t safety_status = 0x00U;
-volatile uint8_t safety_alive = 0U;
-volatile uint8_t safety_level = 0U;
-volatile uint8_t safety_reason = 0U;
+volatile uint8_t command_received = 0U;
+volatile uint8_t command_alive_initialized = 0U;
+volatile uint8_t command_previous_alive = 0U;
 
-volatile uint8_t safety_received = 0U;
-volatile uint8_t safety_alive_initialized = 0U;
-volatile uint8_t safety_previous_alive = 0U;
+volatile uint32_t command_last_rx_tick = 0U;
+volatile uint32_t command_last_alive_change_tick = 0U;
 
-volatile uint32_t safety_last_rx_tick = 0U;
-volatile uint32_t safety_last_alive_change_tick = 0U;
+/* ==========================================================================
+ * MOTOR STATUS / CONTROL
+ * ========================================================================== */
+volatile uint8_t motor_state = MOTOR_STATE_STOP;
+volatile uint8_t motor_fault_flags = 0U;
 
-/* ========================================================================== */
-/* MOTOR STATE                                                                */
-/* ========================================================================== */
+volatile uint8_t requested_output_percent = 0U;
+volatile uint8_t actual_pwm_percent = 0U;
+volatile uint8_t applied_output_limit = 0U;
 
-volatile uint8_t  motor_state = MOTOR_STATE_STOP;
-volatile uint8_t  motor_fault_flags = 0U;
-volatile uint8_t  motor_output_percent = 0U;
-volatile uint8_t  motor_alive_counter = 0U;
+volatile uint8_t applied_command_counter = 0U;
+volatile uint8_t motor_status_alive_counter = 0U;
 
-volatile uint8_t  estop_latched = 0U;
+/* No speed sensor yet */
+volatile uint16_t vehicle_speed_raw = 0xFFFFU;
 
+/* No motor-driver diagnostic input yet */
+volatile uint8_t motor_driver_fault_active = 0U;
+
+/* ESC pulse state */
 volatile uint16_t esc_target_us = ESC_NEUTRAL_US;
 volatile uint16_t esc_current_us = ESC_NEUTRAL_US;
 
 /* USER CODE END PV */
 
-
 /* USER CODE BEGIN PFP */
+
+static void ESC_SetPulse(uint16_t pulse_us);
+static uint16_t Motor_PercentToEscPulse(uint8_t percent);
+static uint8_t ESC_PulseToPercent(uint16_t pulse_us);
 
 static void CAN_Filter_Config(void);
 static void CAN_ProcessRx(void);
 static void CAN_ParsePedal(const uint8_t data[8]);
-static void CAN_ParseSafety(const uint8_t data[8]);
-static void Motor_SendStatus(void);
+static void CAN_ParseMotorCommand(const uint8_t data[8]);
 
-static void ESC_SetPulse(uint16_t pulse_us);
 static uint8_t Motor_UpdateFaultFlags(void);
-static uint8_t Motor_GetAllowedOutputPercent(void);
-static uint16_t Motor_PercentToEscPulse(uint8_t percent);
+static uint8_t Motor_CalculateOutputPercent(void);
 static void Motor_Update(void);
+static void Motor_SendStatus(void);
 
 /* USER CODE END PFP */
 
-
 /* USER CODE BEGIN 0 */
 
-/* ========================================================================== */
-/* ESC                                                                        */
-/* ========================================================================== */
-
+/* ==========================================================================
+ * ESC
+ * ========================================================================== */
 static void ESC_SetPulse(uint16_t pulse_us)
 {
     if (pulse_us < ESC_ABSOLUTE_MIN_US)
@@ -282,26 +263,81 @@ static void ESC_SetPulse(uint16_t pulse_us)
     esc_current_us = pulse_us;
 }
 
+/* 0% -> 1500 us, 1~100% -> 1600~1800 us */
+static uint16_t Motor_PercentToEscPulse(uint8_t percent)
+{
+    uint32_t range;
+    uint32_t pulse;
 
-/* ========================================================================== */
-/* CAN FILTER                                                                 */
-/* ========================================================================== */
+    if (percent == 0U)
+    {
+        return ESC_NEUTRAL_US;
+    }
 
+    if (percent > 100U)
+    {
+        percent = 100U;
+    }
+
+    range = (uint32_t)(ESC_DRIVE_MAX_US - ESC_DRIVE_MIN_US);
+
+    pulse =
+        (uint32_t)ESC_DRIVE_MIN_US +
+        (((uint32_t)(percent - 1U) * range) / 99U);
+
+    if (pulse > ESC_DRIVE_MAX_US)
+    {
+        pulse = ESC_DRIVE_MAX_US;
+    }
+
+    return (uint16_t)pulse;
+}
+
+/* Convert actual ESC pulse back to 0~100% for MOTOR_STATUS Byte0 */
+static uint8_t ESC_PulseToPercent(uint16_t pulse_us)
+{
+    uint32_t range;
+    uint32_t offset;
+    uint32_t percent;
+
+    if (pulse_us < ESC_DRIVE_MIN_US)
+    {
+        return 0U;
+    }
+
+    if (pulse_us >= ESC_DRIVE_MAX_US)
+    {
+        return 100U;
+    }
+
+    range = (uint32_t)(ESC_DRIVE_MAX_US - ESC_DRIVE_MIN_US);
+    offset = (uint32_t)(pulse_us - ESC_DRIVE_MIN_US);
+
+    percent = 1U + ((offset * 99U) / range);
+
+    if (percent > 100U)
+    {
+        percent = 100U;
+    }
+
+    return (uint8_t)percent;
+}
+
+/* ==========================================================================
+ * CAN FILTER
+ * Receive all standard CAN frames into FIFO0.
+ * Actual IDs are selected in software.
+ * ========================================================================== */
 static void CAN_Filter_Config(void)
 {
     CAN_FilterTypeDef filter = {0};
 
-    /*
-     * 0x100, 0x120을 둘 다 받기 위해 CAN1 Standard frame을
-     * FIFO0로 받은 뒤 Software에서 필요한 ID만 처리한다.
-     */
     filter.FilterBank = 0;
     filter.FilterMode = CAN_FILTERMODE_IDMASK;
     filter.FilterScale = CAN_FILTERSCALE_32BIT;
 
     filter.FilterIdHigh = 0x0000U;
     filter.FilterIdLow = 0x0000U;
-
     filter.FilterMaskIdHigh = 0x0000U;
     filter.FilterMaskIdLow = 0x0000U;
 
@@ -315,27 +351,26 @@ static void CAN_Filter_Config(void)
     }
 }
 
-
-/* ========================================================================== */
-/* PEDAL PARSE                                                                */
-/* ========================================================================== */
-
+/* ==========================================================================
+ * PEDAL_STATUS 0x100
+ * ========================================================================== */
 static void CAN_ParsePedal(const uint8_t data[8])
 {
     uint32_t now = HAL_GetTick();
     uint8_t new_alive = data[7];
 
-    pedal_accel = data[0];
-    pedal_brake = data[1];
-
-    if (pedal_accel > 100U)
+    /* Reject invalid application values safely */
+    if ((data[0] > 100U) || (data[1] > 100U))
     {
-        pedal_accel = 100U;
+        pedal_accel = 0U;
+        pedal_brake = 0U;
+        pedal_sensor_status = 0xFFU;
     }
-
-    if (pedal_brake > 100U)
+    else
     {
-        pedal_brake = 100U;
+        pedal_accel = data[0];
+        pedal_brake = data[1];
+        pedal_sensor_status = data[6];
     }
 
     pedal_accel_rate =
@@ -344,17 +379,16 @@ static void CAN_ParsePedal(const uint8_t data[8])
     pedal_brake_rate =
         (int16_t)(((uint16_t)data[5] << 8) | (uint16_t)data[4]);
 
-    pedal_status = data[6];
     pedal_alive = new_alive;
 
-    pedal_last_rx_tick = now;
     pedal_received = 1U;
+    pedal_last_rx_tick = now;
 
     if (pedal_alive_initialized == 0U)
     {
+        pedal_alive_initialized = 1U;
         pedal_previous_alive = new_alive;
         pedal_last_alive_change_tick = now;
-        pedal_alive_initialized = 1U;
     }
     else if (new_alive != pedal_previous_alive)
     {
@@ -363,73 +397,105 @@ static void CAN_ParsePedal(const uint8_t data[8])
     }
 }
 
-
-/* ========================================================================== */
-/* SAFETY PARSE                                                               */
-/* ========================================================================== */
-
-static void CAN_ParseSafety(const uint8_t data[8])
+/* ==========================================================================
+ * MOTOR_COMMAND 0x120
+ *
+ * Accepted only when:
+ * - Valid flag = 1
+ * - reserved flag bits = 0
+ * - mode = 0..2
+ * - output limit = 0..100
+ * - risk level = 0..3
+ * - reserved bytes B4~B6 = 0
+ * ========================================================================== */
+static void CAN_ParseMotorCommand(const uint8_t data[8])
 {
     uint32_t now = HAL_GetTick();
-    uint8_t new_alive = data[3];
 
-    safety_command = data[0];
+    uint8_t mode = data[0];
+    uint8_t limit = data[1];
+    uint8_t risk = data[2];
+    uint8_t flags = data[3];
+    uint8_t new_alive = data[7];
 
-    safety_output_limit = data[1];
-    if (safety_output_limit > 100U)
+    if ((flags & MOTOR_CMD_FLAG_VALID) == 0U)
     {
-        safety_output_limit = 100U;
+        return;
     }
 
-    safety_status = data[2];
-    safety_alive = new_alive;
-    safety_level = data[4];
-    safety_reason = data[5];
-
-    safety_last_rx_tick = now;
-    safety_received = 1U;
-
-    if (safety_alive_initialized == 0U)
+    if ((flags & (uint8_t)(~MOTOR_CMD_FLAG_ALLOWED_MASK)) != 0U)
     {
-        safety_previous_alive = new_alive;
-        safety_last_alive_change_tick = now;
-        safety_alive_initialized = 1U;
+        return;
     }
-    else if (new_alive != safety_previous_alive)
+
+    if (mode > MOTOR_MODE_STOP)
     {
-        safety_previous_alive = new_alive;
-        safety_last_alive_change_tick = now;
+        return;
+    }
+
+    if (limit > 100U)
+    {
+        return;
+    }
+
+    if (risk > 3U)
+    {
+        return;
+    }
+
+    if ((data[4] != 0x00U) ||
+        (data[5] != 0x00U) ||
+        (data[6] != 0x00U))
+    {
+        return;
+    }
+
+    command_mode = mode;
+    command_output_limit = limit;
+    command_risk_level = risk;
+    command_flags = flags;
+    command_alive = new_alive;
+
+    command_received = 1U;
+    command_last_rx_tick = now;
+
+    if (command_alive_initialized == 0U)
+    {
+        command_alive_initialized = 1U;
+        command_previous_alive = new_alive;
+        command_last_alive_change_tick = now;
+    }
+    else if (new_alive != command_previous_alive)
+    {
+        command_previous_alive = new_alive;
+        command_last_alive_change_tick = now;
     }
 
     /*
-     * Emergency stop은 Motor ECU 내부에서 latch.
+     * This is the last accepted MOTOR_COMMAND Counter.
+     * MOTOR_STATUS Byte6 echoes this counter after application.
      */
-    if (safety_command == SAFETY_CMD_EMERGENCY_STOP)
-    {
-        estop_latched = 1U;
-    }
+    applied_command_counter = new_alive;
 
     /*
-     * E-STOP 해제는:
-     * - Safety ECU가 CLEAR_ESTOP 명령
-     * - Safety status 정상
-     * - 가속페달이 dead-band 이하
-     * 조건에서만 허용.
+     * Immediate fail-safe actions:
+     * STOP / E-STOP do not wait for the next 10 ms motor-control tick.
      */
-    if ((safety_command == SAFETY_CMD_CLEAR_ESTOP) &&
-        (safety_status == SAFETY_STATUS_NORMAL) &&
-        (pedal_accel <= ACCEL_DEADBAND_PERCENT))
+    if ((flags & MOTOR_CMD_FLAG_ESTOP) != 0U)
     {
-        estop_latched = 0U;
-        safety_command = SAFETY_CMD_STOP;
+        ESC_SetPulse(ESC_NEUTRAL_US);
+        actual_pwm_percent = 0U;
+    }
+    else if (mode == MOTOR_MODE_STOP)
+    {
+        ESC_SetPulse(ESC_NEUTRAL_US);
+        actual_pwm_percent = 0U;
     }
 }
 
-
-/* ========================================================================== */
-/* CAN RX POLLING                                                             */
-/* ========================================================================== */
-
+/* ==========================================================================
+ * CAN RX
+ * ========================================================================== */
 static void CAN_ProcessRx(void)
 {
     CAN_RxHeaderTypeDef rxHeader;
@@ -465,246 +531,204 @@ static void CAN_ProcessRx(void)
         {
             CAN_ParsePedal(rxData);
         }
-        else if (rxHeader.StdId == CAN_ID_SAFETY_MOTOR_CMD)
+        else if (rxHeader.StdId == CAN_ID_MOTOR_COMMAND)
         {
-            CAN_ParseSafety(rxData);
-        }
-        else
-        {
-            /* Ignore unrelated CAN IDs */
+            CAN_ParseMotorCommand(rxData);
         }
     }
 }
 
-
-/* ========================================================================== */
-/* MOTOR FAULT EVALUATION                                                     */
-/* ========================================================================== */
-
+/* ==========================================================================
+ * MOTOR_STATUS Byte5 fault flags
+ * ========================================================================== */
 static uint8_t Motor_UpdateFaultFlags(void)
 {
     uint32_t now = HAL_GetTick();
     uint8_t faults = 0U;
 
+    if (motor_driver_fault_active != 0U)
+    {
+        faults |= MOTOR_FAULT_DRIVER;
+    }
+
+    /*
+     * PEDAL_STATUS communication fault.
+     * Missing frames OR stuck Alive Counter are both represented as
+     * PEDAL_STATUS Timeout because the published MOTOR_STATUS has one bit.
+     */
     if ((pedal_received == 0U) ||
         ((now - pedal_last_rx_tick) > PEDAL_TIMEOUT_MS))
     {
         faults |= MOTOR_FAULT_PEDAL_TIMEOUT;
     }
-
-    if ((safety_received == 0U) ||
-        ((now - safety_last_rx_tick) > SAFETY_TIMEOUT_MS))
+    else if ((pedal_alive_initialized != 0U) &&
+             ((now - pedal_last_alive_change_tick) > ALIVE_STUCK_TIMEOUT_MS))
     {
-        faults |= MOTOR_FAULT_SAFETY_TIMEOUT;
+        faults |= MOTOR_FAULT_PEDAL_TIMEOUT;
     }
 
-    if ((pedal_alive_initialized != 0U) &&
-        ((now - pedal_last_alive_change_tick) > ALIVE_STUCK_TIMEOUT_MS))
+    /*
+     * MOTOR_COMMAND communication fault.
+     */
+    if ((command_received == 0U) ||
+        ((now - command_last_rx_tick) > MOTOR_COMMAND_TIMEOUT_MS))
     {
-        faults |= MOTOR_FAULT_PEDAL_ALIVE;
+        faults |= MOTOR_FAULT_COMMAND_TIMEOUT;
+    }
+    else if ((command_alive_initialized != 0U) &&
+             ((now - command_last_alive_change_tick) > ALIVE_STUCK_TIMEOUT_MS))
+    {
+        faults |= MOTOR_FAULT_COMMAND_TIMEOUT;
     }
 
-    if ((safety_alive_initialized != 0U) &&
-        ((now - safety_last_alive_change_tick) > ALIVE_STUCK_TIMEOUT_MS))
+    /*
+     * E-STOP is active while MOTOR_COMMAND Byte3 bit1 = 1.
+     * No separate latch/clear protocol is invented here.
+     */
+    if ((command_received != 0U) &&
+        ((command_flags & MOTOR_CMD_FLAG_ESTOP) != 0U))
     {
-        faults |= MOTOR_FAULT_SAFETY_ALIVE;
-    }
-
-    if ((pedal_received != 0U) &&
-        (pedal_status != PEDAL_STATUS_NORMAL))
-    {
-        faults |= MOTOR_FAULT_PEDAL_STATUS;
-    }
-
-    if ((safety_received != 0U) &&
-        (safety_status != SAFETY_STATUS_NORMAL))
-    {
-        faults |= MOTOR_FAULT_SAFETY_STATUS;
-    }
-
-    if (estop_latched != 0U)
-    {
-        faults |= MOTOR_FAULT_ESTOP_LATCHED;
+        faults |= MOTOR_FAULT_ESTOP_ACTIVE;
     }
 
     motor_fault_flags = faults;
     return faults;
 }
 
-
-/* ========================================================================== */
-/* PEDAL + SAFETY -> FINAL MOTOR OUTPUT                                       */
-/* ========================================================================== */
-
-static uint8_t Motor_GetAllowedOutputPercent(void)
+/* ==========================================================================
+ * Calculate final output from PEDAL_STATUS + MOTOR_COMMAND
+ * ========================================================================== */
+static uint8_t Motor_CalculateOutputPercent(void)
 {
-    uint8_t requested;
-    uint8_t limited;
+    uint8_t output;
+
+    applied_output_limit = 0U;
 
     /*
-     * 모든 필수 ECU 통신/상태 검사.
+     * Communication / motor driver / E-STOP fault.
      */
     if (Motor_UpdateFaultFlags() != 0U)
-    {
-        if (estop_latched != 0U)
-        {
-            motor_state = MOTOR_STATE_ESTOP;
-        }
-        else
-        {
-            motor_state = MOTOR_STATE_FAULT;
-        }
-
-        return 0U;
-    }
-
-    /*
-     * 운전자 브레이크가 최우선.
-     */
-    if (pedal_brake >= BRAKE_THRESHOLD_PERCENT)
-    {
-        motor_state = MOTOR_STATE_BRAKE;
-        return 0U;
-    }
-
-    /*
-     * Safety ECU 명령 우선.
-     */
-    if (safety_command == SAFETY_CMD_EMERGENCY_STOP)
-    {
-        estop_latched = 1U;
-        motor_fault_flags |= MOTOR_FAULT_ESTOP_LATCHED;
-        motor_state = MOTOR_STATE_ESTOP;
-        return 0U;
-    }
-
-    if (safety_command == SAFETY_CMD_BRAKE)
-    {
-        motor_state = MOTOR_STATE_BRAKE;
-        return 0U;
-    }
-
-    if (safety_command == SAFETY_CMD_STOP)
-    {
-        motor_state = MOTOR_STATE_STOP;
-        return 0U;
-    }
-
-    if (safety_command == SAFETY_CMD_CLEAR_ESTOP)
-    {
-        motor_state = MOTOR_STATE_STOP;
-        return 0U;
-    }
-
-    if (safety_command != SAFETY_CMD_DRIVE_ALLOW)
     {
         motor_state = MOTOR_STATE_FAULT;
         return 0U;
     }
 
     /*
-     * Accelerator dead-band.
+     * Pedal sensor status:
+     * 0x00 = Normal.
+     *
+     * The published MOTOR_STATUS fault byte has no dedicated pedal-sensor
+     * fault bit, so do not invent a new bit. We still fail-safe to zero
+     * and report Motor State = Fault.
+     */
+    if (pedal_sensor_status != PEDAL_STATUS_NORMAL)
+    {
+        motor_state = MOTOR_STATE_FAULT;
+        return 0U;
+    }
+
+    /*
+     * Brake overrides accelerator.
+     */
+    if (pedal_brake >= BRAKE_THRESHOLD_PERCENT)
+    {
+        motor_state = MOTOR_STATE_STOP;
+        return 0U;
+    }
+
+    /*
+     * Accelerator released.
      */
     if (pedal_accel <= ACCEL_DEADBAND_PERCENT)
     {
+        if (command_mode == MOTOR_MODE_NORMAL)
+        {
+            applied_output_limit = 100U;
+        }
+        else if (command_mode == MOTOR_MODE_OUTPUT_LIMIT)
+        {
+            applied_output_limit = command_output_limit;
+        }
+        else
+        {
+            applied_output_limit = 0U;
+        }
+
         motor_state = MOTOR_STATE_STOP;
         return 0U;
     }
 
-    /*
-     * Driver request.
-     */
-    requested = pedal_accel;
-
-    /*
-     * Safety output limit.
-     *
-     * 예:
-     * Pedal 80%, Safety limit 40% -> Motor 40%
-     * Pedal 20%, Safety limit 40% -> Motor 20%
-     */
-    limited = requested;
-
-    if (limited > safety_output_limit)
+    switch (command_mode)
     {
-        limited = safety_output_limit;
-    }
+        case MOTOR_MODE_NORMAL:
 
-    if (limited == 0U)
-    {
-        motor_state = MOTOR_STATE_STOP;
-        return 0U;
-    }
+            applied_output_limit = 100U;
+            motor_state = MOTOR_STATE_RUNNING;
 
-    motor_state = MOTOR_STATE_DRIVE;
-    return limited;
+            return pedal_accel;
+
+        case MOTOR_MODE_OUTPUT_LIMIT:
+
+            applied_output_limit = command_output_limit;
+
+            output = pedal_accel;
+
+            if (output > command_output_limit)
+            {
+                output = command_output_limit;
+            }
+
+            if (output == 0U)
+            {
+                motor_state = MOTOR_STATE_STOP;
+                return 0U;
+            }
+
+            motor_state = MOTOR_STATE_OUTPUT_LIMITED;
+
+            return output;
+
+        case MOTOR_MODE_STOP:
+
+            applied_output_limit = 0U;
+            motor_state = MOTOR_STATE_STOP;
+
+            return 0U;
+
+        default:
+
+            motor_state = MOTOR_STATE_FAULT;
+            return 0U;
+    }
 }
 
-
-/* ========================================================================== */
-/* OUTPUT % -> RC ESC PWM                                                     */
-/* ========================================================================== */
-
-static uint16_t Motor_PercentToEscPulse(uint8_t percent)
-{
-    uint32_t pulse;
-    uint32_t range;
-
-    if (percent == 0U)
-    {
-        return ESC_NEUTRAL_US;
-    }
-
-    if (percent > 100U)
-    {
-        percent = 100U;
-    }
-
-    /*
-     * 1~100% -> ESC_DRIVE_MIN_US ~ ESC_DRIVE_MAX_US
-     */
-    range = (uint32_t)(ESC_DRIVE_MAX_US - ESC_DRIVE_MIN_US);
-
-    pulse =
-        (uint32_t)ESC_DRIVE_MIN_US +
-        (((uint32_t)(percent - 1U) * range) / 99U);
-
-    if (pulse > ESC_DRIVE_MAX_US)
-    {
-        pulse = ESC_DRIVE_MAX_US;
-    }
-
-    return (uint16_t)pulse;
-}
-
-
-/* ========================================================================== */
-/* MOTOR UPDATE                                                               */
-/* ========================================================================== */
-
+/* ==========================================================================
+ * Motor control update - every 10 ms
+ * ========================================================================== */
 static void Motor_Update(void)
 {
-    uint8_t allowed_percent;
+    uint8_t output_percent;
     uint16_t target;
     uint16_t next;
 
-    allowed_percent = Motor_GetAllowedOutputPercent();
-    motor_output_percent = allowed_percent;
+    output_percent = Motor_CalculateOutputPercent();
+    requested_output_percent = output_percent;
 
-    target = Motor_PercentToEscPulse(allowed_percent);
+    target = Motor_PercentToEscPulse(output_percent);
     esc_target_us = target;
 
     /*
-     * STOP / BRAKE / FAULT / ESTOP은 즉시 Neutral.
+     * Fault / STOP / brake / accelerator released -> neutral immediately.
      */
     if (target == ESC_NEUTRAL_US)
     {
         ESC_SetPulse(ESC_NEUTRAL_US);
+        actual_pwm_percent = 0U;
         return;
     }
 
     /*
-     * 정상 DRIVE에서만 ramp 적용.
+     * Soft acceleration only.
      */
     if (esc_current_us < target)
     {
@@ -720,36 +744,24 @@ static void Motor_Update(void)
     else if (esc_current_us > target)
     {
         /*
-         * 가속페달을 놓거나 Safety limit가 낮아진 경우
-         * 부드럽게 출력 감소.
+         * Output reduction is immediate.
          */
-        if (esc_current_us > (ESC_NEUTRAL_US + ESC_RAMP_STEP_US))
-        {
-            next = (uint16_t)(esc_current_us - ESC_RAMP_STEP_US);
-        }
-        else
-        {
-            next = target;
-        }
-
-        if (next < target)
-        {
-            next = target;
-        }
-
-        ESC_SetPulse(next);
+        ESC_SetPulse(target);
     }
     else
     {
         ESC_SetPulse(target);
     }
+
+    /*
+     * Actual PWM is based on the pulse actually being applied now.
+     */
+    actual_pwm_percent = ESC_PulseToPercent(esc_current_us);
 }
 
-
-/* ========================================================================== */
-/* MOTOR STATUS TX : 0x210                                                    */
-/* ========================================================================== */
-
+/* ==========================================================================
+ * MOTOR_STATUS 0x210 TX
+ * ========================================================================== */
 static void Motor_SendStatus(void)
 {
     CAN_TxHeaderTypeDef txHeader = {0};
@@ -763,36 +775,46 @@ static void Motor_SendStatus(void)
     txHeader.DLC = 8U;
     txHeader.TransmitGlobalTime = DISABLE;
 
-    txData[0] = motor_state;
-    txData[1] = pedal_accel;
-    txData[2] = motor_output_percent;
-    txData[3] = pedal_status;
-    txData[4] = safety_command;
-    txData[5] = safety_status;
-    txData[6] = motor_fault_flags;
-    txData[7] = motor_alive_counter++;
+    /* B0 Actual PWM */
+    txData[0] = actual_pwm_percent;
 
-    /*
-     * Mailbox가 있을 때만 전송.
-     * Status TX 실패가 실제 모터 제어를 막지는 않는다.
-     */
+    /* B1 Applied Output Limit */
+    txData[1] = applied_output_limit;
+
+    /* B2~3 Vehicle Speed, Little Endian */
+    txData[2] = (uint8_t)(vehicle_speed_raw & 0xFFU);
+    txData[3] = (uint8_t)((vehicle_speed_raw >> 8) & 0xFFU);
+
+    /* B4 Motor State */
+    txData[4] = motor_state;
+
+    /* B5 Fault Flags */
+    txData[5] = motor_fault_flags;
+
+    /* B6 Last Applied MOTOR_COMMAND Counter */
+    txData[6] = applied_command_counter;
+
+    /* B7 MOTOR_STATUS Alive Counter */
+    txData[7] = motor_status_alive_counter;
+
     if (HAL_CAN_GetTxMailboxesFreeLevel(&hcan1) > 0U)
     {
-        (void)HAL_CAN_AddTxMessage(
-            &hcan1,
-            &txHeader,
-            txData,
-            &txMailbox
-        );
+        if (HAL_CAN_AddTxMessage(
+                &hcan1,
+                &txHeader,
+                txData,
+                &txMailbox) == HAL_OK)
+        {
+            motor_status_alive_counter++;
+        }
     }
 }
 
 /* USER CODE END 0 */
 
-
-/**
-  * @brief  Main
-  */
+/* ==========================================================================
+ * MAIN
+ * ========================================================================== */
 int main(void)
 {
     uint32_t motor_tick;
@@ -802,27 +824,13 @@ int main(void)
     SystemClock_Config();
 
     MX_GPIO_Init();
-    MX_CAN1_Init();
+
+    /*
+     * No 5-second startup 1500 us hold.
+     * Initialize CAN and PWM, then enter normal control immediately.
+     */
     MX_TIM1_Init();
-
-    /* USER CODE BEGIN 2 */
-
-    /*
-     * ESC PWM 시작 전 Neutral 세팅.
-     */
-    ESC_SetPulse(ESC_NEUTRAL_US);
-
-    if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK)
-    {
-        Error_Handler();
-    }
-
-    /*
-     * ESC가 Neutral을 인식할 시간.
-     * STM32를 먼저 켜고 차량 ESC 전원을 켜는 것을 권장.
-     */
-    HAL_Delay(3000);
-
+    MX_CAN1_Init();
     CAN_Filter_Config();
 
     if (HAL_CAN_Start(&hcan1) != HAL_OK)
@@ -830,31 +838,24 @@ int main(void)
         Error_Handler();
     }
 
+    if (HAL_TIM_PWM_Start(&htim1, TIM_CHANNEL_1) != HAL_OK)
+    {
+        Error_Handler();
+    }
+
     motor_tick = HAL_GetTick();
     status_tick = HAL_GetTick();
 
-    /* USER CODE END 2 */
-
     while (1)
     {
-        /*
-         * CAN RX는 polling.
-         * RX interrupt 설정이 없어도 동작.
-         */
         CAN_ProcessRx();
 
-        /*
-         * Motor control : 10 ms
-         */
         if ((HAL_GetTick() - motor_tick) >= MOTOR_CONTROL_PERIOD_MS)
         {
             motor_tick = HAL_GetTick();
             Motor_Update();
         }
 
-        /*
-         * Motor Status : 20 ms
-         */
         if ((HAL_GetTick() - status_tick) >= MOTOR_STATUS_PERIOD_MS)
         {
             status_tick = HAL_GetTick();
@@ -863,27 +864,40 @@ int main(void)
     }
 }
 
-
-/* ========================================================================== */
-/* CAN1 INIT : 500 kbps                                                       */
-/* ========================================================================== */
-
+/* ==========================================================================
+ * CAN1 INIT : 500 kbps
+ *
+ * System clock:
+ * APB1 = 42 MHz
+ *
+ * 42 MHz / [6 * (1 + 11 + 2)] = 500 kbps
+ * ========================================================================== */
 static void MX_CAN1_Init(void)
 {
-    hcan1.Instance = CAN1;
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
+
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+    __HAL_RCC_CAN1_CLK_ENABLE();
 
     /*
-     * APB1 = 45 MHz
-     *
-     * 45 MHz / [5 * (1 + 15 + 2)]
-     * = 500 kbps
-     *
-     * Sample Point = (1 + 15) / 18 = 88.9%
+     * PA11 CAN1_RX
+     * PA12 CAN1_TX
      */
-    hcan1.Init.Prescaler = 5;
+    GPIO_InitStruct.Pin = GPIO_PIN_11 | GPIO_PIN_12;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_VERY_HIGH;
+    GPIO_InitStruct.Alternate = GPIO_AF9_CAN1;
+
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
+
+    hcan1.Instance = CAN1;
+
+    hcan1.Init.Prescaler = 6;
     hcan1.Init.Mode = CAN_MODE_NORMAL;
+
     hcan1.Init.SyncJumpWidth = CAN_SJW_1TQ;
-    hcan1.Init.TimeSeg1 = CAN_BS1_15TQ;
+    hcan1.Init.TimeSeg1 = CAN_BS1_11TQ;
     hcan1.Init.TimeSeg2 = CAN_BS2_2TQ;
 
     hcan1.Init.TimeTriggeredMode = DISABLE;
@@ -899,44 +913,32 @@ static void MX_CAN1_Init(void)
     }
 }
 
-
-/* ========================================================================== */
-/* TIM1 INIT : PA8 / CH1 / 50 Hz                                              */
-/* ========================================================================== */
-
+/* ==========================================================================
+ * TIM1 PWM INIT : PA8 / 50 Hz
+ *
+ * TIM1 clock = 84 MHz
+ * PSC = 83     -> 1 MHz
+ * ARR = 19999  -> 20 ms -> 50 Hz
+ * ========================================================================== */
 static void MX_TIM1_Init(void)
 {
     TIM_OC_InitTypeDef sConfigOC = {0};
-    TIM_MasterConfigTypeDef sMasterConfig = {0};
+    GPIO_InitTypeDef GPIO_InitStruct = {0};
 
-    /*
-     * APB2 timer clock = 180 MHz
-     *
-     * 180 MHz / (179 + 1) = 1 MHz
-     * 1 count = 1 us
-     *
-     * ARR = 19999
-     * Period = 20000 us = 20 ms = 50 Hz
-     */
+    __HAL_RCC_TIM1_CLK_ENABLE();
+    __HAL_RCC_GPIOA_CLK_ENABLE();
+
     htim1.Instance = TIM1;
-    htim1.Init.Prescaler = 179;
+
+    htim1.Init.Prescaler = 83;
     htim1.Init.CounterMode = TIM_COUNTERMODE_UP;
     htim1.Init.Period = 19999;
     htim1.Init.ClockDivision = TIM_CLOCKDIVISION_DIV1;
     htim1.Init.RepetitionCounter = 0;
-    htim1.Init.AutoReloadPreload = TIM_AUTORELOAD_PRELOAD_DISABLE;
+    htim1.Init.AutoReloadPreload =
+        TIM_AUTORELOAD_PRELOAD_DISABLE;
 
     if (HAL_TIM_PWM_Init(&htim1) != HAL_OK)
-    {
-        Error_Handler();
-    }
-
-    sMasterConfig.MasterOutputTrigger = TIM_TRGO_RESET;
-    sMasterConfig.MasterSlaveMode = TIM_MASTERSLAVEMODE_DISABLE;
-
-    if (HAL_TIMEx_MasterConfigSynchronization(
-            &htim1,
-            &sMasterConfig) != HAL_OK)
     {
         Error_Handler();
     }
@@ -957,24 +959,40 @@ static void MX_TIM1_Init(void)
         Error_Handler();
     }
 
-    HAL_TIM_MspPostInit(&htim1);
+    /*
+     * PA8 = TIM1_CH1
+     *
+     * Configure directly to preserve the PWM behavior already confirmed.
+     */
+    GPIO_InitStruct.Pin = GPIO_PIN_8;
+    GPIO_InitStruct.Mode = GPIO_MODE_AF_PP;
+    GPIO_InitStruct.Pull = GPIO_NOPULL;
+    GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
+    GPIO_InitStruct.Alternate = GPIO_AF1_TIM1;
+
+    HAL_GPIO_Init(GPIOA, &GPIO_InitStruct);
 }
 
-
-/* ========================================================================== */
-/* GPIO INIT                                                                  */
-/* ========================================================================== */
-
+/* ==========================================================================
+ * GPIO INIT
+ * ========================================================================== */
 static void MX_GPIO_Init(void)
 {
     __HAL_RCC_GPIOA_CLK_ENABLE();
 }
 
-
-/* ========================================================================== */
-/* SYSTEM CLOCK : 180 MHz                                                     */
-/* ========================================================================== */
-
+/* ==========================================================================
+ * SYSTEM CLOCK : 84 MHz
+ *
+ * HSI = 16 MHz
+ * PLLM = 16
+ * PLLN = 336
+ * PLLP = 4
+ *
+ * SYSCLK = 84 MHz
+ * APB1   = 42 MHz
+ * APB2   = 84 MHz
+ * ========================================================================== */
 void SystemClock_Config(void)
 {
     RCC_OscInitTypeDef RCC_OscInitStruct = {0};
@@ -983,17 +1001,9 @@ void SystemClock_Config(void)
     __HAL_RCC_PWR_CLK_ENABLE();
 
     __HAL_PWR_VOLTAGESCALING_CONFIG(
-        PWR_REGULATOR_VOLTAGE_SCALE1
+        PWR_REGULATOR_VOLTAGE_SCALE2
     );
 
-    /*
-     * HSI = 16 MHz
-     * PLLM = 8
-     * PLLN = 180
-     * PLLP = 2
-     *
-     * SYSCLK = 180 MHz
-     */
     RCC_OscInitStruct.OscillatorType =
         RCC_OSCILLATORTYPE_HSI;
 
@@ -1009,18 +1019,13 @@ void SystemClock_Config(void)
     RCC_OscInitStruct.PLL.PLLSource =
         RCC_PLLSOURCE_HSI;
 
-    RCC_OscInitStruct.PLL.PLLM = 8;
-    RCC_OscInitStruct.PLL.PLLN = 180;
-    RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV2;
+    RCC_OscInitStruct.PLL.PLLM = 16;
+    RCC_OscInitStruct.PLL.PLLN = 336;
+    RCC_OscInitStruct.PLL.PLLP = RCC_PLLP_DIV4;
     RCC_OscInitStruct.PLL.PLLQ = 7;
     RCC_OscInitStruct.PLL.PLLR = 2;
 
     if (HAL_RCC_OscConfig(&RCC_OscInitStruct) != HAL_OK)
-    {
-        Error_Handler();
-    }
-
-    if (HAL_PWREx_EnableOverDrive() != HAL_OK)
     {
         Error_Handler();
     }
@@ -1038,28 +1043,26 @@ void SystemClock_Config(void)
         RCC_SYSCLK_DIV1;
 
     RCC_ClkInitStruct.APB1CLKDivider =
-        RCC_HCLK_DIV4;
+        RCC_HCLK_DIV2;
 
     RCC_ClkInitStruct.APB2CLKDivider =
-        RCC_HCLK_DIV2;
+        RCC_HCLK_DIV1;
 
     if (HAL_RCC_ClockConfig(
             &RCC_ClkInitStruct,
-            FLASH_LATENCY_5) != HAL_OK)
+            FLASH_LATENCY_2) != HAL_OK)
     {
         Error_Handler();
     }
 }
 
-
-/* ========================================================================== */
-/* ERROR HANDLER                                                              */
-/* ========================================================================== */
-
+/* ==========================================================================
+ * ERROR HANDLER
+ * ========================================================================== */
 void Error_Handler(void)
 {
     /*
-     * TIM1이 초기화된 뒤 오류가 발생했다면 ESC Neutral.
+     * If TIM1 is already active, keep ESC at neutral.
      */
     if (htim1.Instance == TIM1)
     {
@@ -1076,7 +1079,6 @@ void Error_Handler(void)
     {
     }
 }
-
 
 #ifdef USE_FULL_ASSERT
 void assert_failed(uint8_t *file, uint32_t line)

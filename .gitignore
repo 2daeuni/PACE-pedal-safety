@@ -28,3 +28,6 @@ Thumbs.db
 
 # STM32CubeIDE debug launch configuration
 *.launch
+
+# Source backups
+*.backup_*

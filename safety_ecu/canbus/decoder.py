@@ -3,6 +3,7 @@ import struct
 
 PEDAL_STATUS_ID = 0x100
 HAPTIC_STATUS_ID = 0x200
+MOTOR_STATUS_ID = 0x210
 
 
 SENSOR_STATUS_BITS = {
@@ -173,6 +174,86 @@ def decode_haptic_status(data: bytes):
         "fault_code": fault_code,
         "command_timeout": command_timeout,
         "ecu_status": ecu_status,
+        "alive_counter": alive_counter,
+    }
+
+MOTOR_STATE_NAMES = {
+    0: "STOP",
+    1: "RUNNING",
+    2: "OUTPUT_LIMITED",
+    3: "FAULT",
+}
+
+MOTOR_FAULT_BITS = {
+    0x01: "MOTOR_DRIVER_FAULT",
+    0x02: "PEDAL_TIMEOUT",
+    0x04: "COMMAND_TIMEOUT",
+    0x08: "ESTOP_ACTIVE",
+}
+
+
+def decode_motor_status(data: bytes):
+    if len(data) != 8:
+        raise ValueError(
+            f"MOTOR_STATUS must be 8 bytes, got {len(data)}"
+        )
+
+    actual_pwm = data[0]
+    applied_output_limit = data[1]
+    vehicle_speed_raw = struct.unpack_from("<H", data, 2)[0]
+    motor_state = data[4]
+    fault_flags = data[5]
+    applied_command_counter = data[6]
+    alive_counter = data[7]
+
+    if actual_pwm > 100:
+        raise ValueError(
+            f"Actual PWM out of range: {actual_pwm}%"
+        )
+
+    if applied_output_limit > 100:
+        raise ValueError(
+            f"Applied output limit out of range: "
+            f"{applied_output_limit}%"
+        )
+
+    if motor_state not in MOTOR_STATE_NAMES:
+        raise ValueError(
+            f"Invalid motor state: {motor_state}"
+        )
+
+    if fault_flags & 0xF0:
+        raise ValueError(
+            f"Reserved motor fault bits are set: "
+            f"0x{fault_flags:02X}"
+        )
+
+    vehicle_speed_valid = vehicle_speed_raw != 0xFFFF
+
+    vehicle_speed = (
+        vehicle_speed_raw * 0.01
+        if vehicle_speed_valid
+        else None
+    )
+
+    fault_errors = [
+        name
+        for bit, name in MOTOR_FAULT_BITS.items()
+        if fault_flags & bit
+    ]
+
+    return {
+        "actual_pwm": actual_pwm,
+        "applied_output_limit": applied_output_limit,
+        "vehicle_speed": vehicle_speed,
+        "vehicle_speed_valid": vehicle_speed_valid,
+        "vehicle_speed_raw": vehicle_speed_raw,
+        "motor_state": motor_state,
+        "motor_state_name": MOTOR_STATE_NAMES[motor_state],
+        "fault_flags": fault_flags,
+        "fault_errors": fault_errors,
+        "motor_normal": fault_flags == 0 and motor_state != 3,
+        "applied_command_counter": applied_command_counter,
         "alive_counter": alive_counter,
     }
 

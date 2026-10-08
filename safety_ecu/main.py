@@ -7,8 +7,10 @@ from canbus.sender import CANSender
 from canbus.decoder import (
     PEDAL_STATUS_ID,
     HAPTIC_STATUS_ID,
+    MOTOR_STATUS_ID,
     decode_pedal_status,
     decode_haptic_status,
+    decode_motor_status,
 )
 
 from control.state import SystemState
@@ -67,6 +69,13 @@ def main():
 
     failsafe = FailSafeManager()
     command_mapper = CommandMapper()
+    # Motor ECU status
+    motor_status = None
+    motor_last_rx_time = None
+
+    motor_communication_fault = True
+    motor_recovery_required = True
+    motor_timeout_reported = False
 
     bns_calculator = BNSCalculator()
     pms_calculator = PMSCalculator()
@@ -346,6 +355,38 @@ def main():
                     except ValueError as error:
                         print(
                             "[HAPTIC] "
+                            f"Invalid message: {error}"
+                        )
+
+                # ---------------------------------------------
+                # MOTOR_STATUS
+                # ---------------------------------------------
+                elif (
+                    msg.arbitration_id
+                    == MOTOR_STATUS_ID
+                ):
+                    try:
+                        motor = decode_motor_status(
+                            msg.data
+                        )
+
+                        motor_status = motor
+                        motor_last_rx_time = (
+                            time.monotonic()
+                        )
+                        print(
+                            f"[MOTOR] "
+                            f"STATE={motor['motor_state_name']} "
+                            f"PWM={motor['actual_pwm']}% "
+                            f"LIMIT={motor['applied_output_limit']}% "
+                            f"FAULT=0x{motor['fault_flags']:02X} "
+                            f"APPLIED_CMD={motor['applied_command_counter']} "
+                            f"ALIVE={motor['alive_counter']}"
+                        )
+
+                    except ValueError as error:
+                        print(
+                            "[MOTOR] "
                             f"Invalid message: {error}"
                         )
 
@@ -645,6 +686,79 @@ def main():
                         failsafe.active
                     ),
                 )
+
+                # -------------------------------------------------
+                # Motor ECU communication / E-STOP recovery
+                # -------------------------------------------------
+                motor_status_fresh = (
+                    motor_status is not None
+                    and motor_last_rx_time is not None
+                    and 0 <= current_time - motor_last_rx_time <= 0.1
+                )
+
+                if not motor_status_fresh:
+                    motor_communication_fault = True
+                    motor_recovery_required = True
+
+                    if not motor_timeout_reported:
+                        print("[MOTOR] STATUS TIMEOUT - E-STOP REQUESTED")
+                        motor_timeout_reported = True
+
+                    commands["motor"] = {
+                        "control_mode": 2,
+                        "output_limit": 0,
+                        "command_flags": 0x03,
+                    }
+
+                else:
+                    motor_communication_fault = False
+                    motor_timeout_reported = False
+
+                    motor_estop_active = (
+                        motor_status["fault_flags"] & 0x08
+                    ) != 0
+
+                    motor_other_fault = (
+                        motor_status["fault_flags"] & 0x07
+                    ) != 0
+
+                    motor_safe_to_recover = (
+                        not failsafe.active
+                        and state.pedal_connected
+                        and state.pedal_sensor_status == 0
+                        and state.accelerator <= 3
+                        and state.brake < 5
+                        and not motor_other_fault
+                    )
+
+                    if failsafe.active:
+                        motor_recovery_required = True
+
+                    elif motor_estop_active:
+                        motor_recovery_required = True
+
+                        if motor_safe_to_recover:
+                            commands["motor"] = {
+                                "control_mode": 2,
+                                "output_limit": 0,
+                                "command_flags": 0x01,
+                            }
+
+                    elif motor_recovery_required:
+                        if (
+                            motor_safe_to_recover
+                            and motor_status["motor_state"] == 0
+                            and motor_status["actual_pwm"] == 0
+                        ):
+                            motor_recovery_required = False
+                            print("[MOTOR] E-STOP RECOVERY CONFIRMED")
+
+                        # Maintain STOP during recovery confirmation.
+                        commands["motor"] = {
+                            "control_mode": 2,
+                            "output_limit": 0,
+                            "command_flags": 0x01,
+                        }
 
                 # ---------------------------------------------
                 # Haptic command
